@@ -51,16 +51,18 @@ jobs:
           linux/scripts/config --file linux/.config --disable LOCALVERSION_AUTO
           linux/scripts/config --file linux/.config \
             --set-str LOCALVERSION "-sm8550-gccd95ec0e251"
-          make -C linux ARCH=arm64 LLVM=1 olddefconfig
+          make -C linux ARCH=arm64 LLVM=1 LOCALVERSION= olddefconfig
           grep -qx 'CONFIG_BATTERY_QCOM_BATTMGR=y' linux/.config
           grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' linux/.config
-          test "$(make -s -C linux ARCH=arm64 LLVM=1 kernelrelease)" = "$KERNEL_RELEASE"
+          actual_release="$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
+          echo "kernel_release=$actual_release"
+          test "$actual_release" = "$KERNEL_RELEASE"
 
       - name: Build kernel
         run: |
           export CCACHE_DIR="$HOME/.ccache"
           export PATH="/usr/lib/ccache:$PATH"
-          make -C linux -j"$(nproc)" ARCH=arm64 LLVM=1
+          make -C linux -j"$(nproc)" ARCH=arm64 LLVM=1 LOCALVERSION=
           test -s linux/arch/arm64/boot/Image.gz
           test -s linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb
 
@@ -94,7 +96,7 @@ jobs:
             echo "workflow_run_id=${GITHUB_RUN_ID}"
             echo "kernel_repository=${KERNEL_REPO}"
             echo "kernel_base=${KERNEL_BASE}"
-            echo "kernel_release=$(make -s -C linux ARCH=arm64 LLVM=1 kernelrelease)"
+            echo "kernel_release=$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
             echo "boot_cmdline=root=PARTLABEL=linux quiet splash plymouth.ignore-serial-consoles fbcon=map:1 module_blacklist=qcom_battmgr"
             echo "BATTERY_QCOM_BATTMGR=built-in for boot-only rollback"
           } > out/PROVENANCE.txt
