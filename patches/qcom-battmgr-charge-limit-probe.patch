@@ -1,0 +1,66 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index b4876aa731d9..3284e36e0537 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -932,6 +932,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
+ 					   u32 target_soc, u32 delta_soc)
+ {
++	int ret;
+ 	struct qcom_battmgr_charge_ctrl_request request = {
+ 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+ 		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+@@ -944,7 +945,17 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
+ 		.delta_soc = cpu_to_le32(delta_soc),
+ 	};
+ 
+-	return qcom_battmgr_request(battmgr, &request, sizeof(request));
++	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
++	if (ret)
++		dev_err(battmgr->dev,
++			"charge-control request target=%u delta=%u failed: %d\n",
++			target_soc, delta_soc, ret);
++	else
++		dev_info(battmgr->dev,
++			 "charge-control request acknowledged: target=%u delta=%u\n",
++			 target_soc, delta_soc);
++
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
+@@ -977,7 +987,7 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -998,7 +1008,7 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -2322,9 +2332,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		}
+ 		break;
+ 	case BATTMGR_REQUEST_NOTIFICATION:
+-	case BATTMGR_CHG_CTRL_LIMIT_EN:
+ 		battmgr->error = 0;
+ 		break;
++	case BATTMGR_CHG_CTRL_LIMIT_EN:
++		dev_info(battmgr->dev,
++			 "charge-control response: payload_len=%zu payload=%*phN\n",
++			 payload_len, (int)min_t(size_t, payload_len, 16),
++			 (const u8 *)resp + sizeof(resp->hdr));
++		battmgr->error = 0;
++		break;
+ 	default:
+ 		if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+ 			dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
