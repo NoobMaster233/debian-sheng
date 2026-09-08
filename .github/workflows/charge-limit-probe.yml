@@ -86,8 +86,9 @@ jobs:
       - name: Record provenance and checksums
         run: |
           mkdir -p out
-          cp boot.img Image.gz-dtb_sheng linux/.config \
+          cp boot.img Image.gz-dtb_sheng \
             patches/qcom-battmgr-charge-limit-probe.patch out/
+          cp linux/.config out/kernel.config
           cp linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb out/
           git -C linux diff > out/kernel.patch
           {
@@ -102,7 +103,7 @@ jobs:
           } > out/PROVENANCE.txt
           (cd out && sha256sum \
             boot.img Image.gz-dtb_sheng sm8550-xiaomi-sheng.dtb \
-            .config kernel.patch qcom-battmgr-charge-limit-probe.patch \
+            kernel.config kernel.patch qcom-battmgr-charge-limit-probe.patch \
             PROVENANCE.txt > SHA256SUMS)
 
       - name: Upload probe artifact
