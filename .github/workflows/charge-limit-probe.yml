@@ -47,9 +47,10 @@ jobs:
       - name: Configure boot-only probe
         run: |
           cp sm8550.config linux/.config
-          linux/scripts/config --enable BATTERY_QCOM_BATTMGR
-          linux/scripts/config --disable LOCALVERSION_AUTO
-          linux/scripts/config --set-str LOCALVERSION "-sm8550-gccd95ec0e251"
+          linux/scripts/config --file linux/.config --enable BATTERY_QCOM_BATTMGR
+          linux/scripts/config --file linux/.config --disable LOCALVERSION_AUTO
+          linux/scripts/config --file linux/.config \
+            --set-str LOCALVERSION "-sm8550-gccd95ec0e251"
           make -C linux ARCH=arm64 LLVM=1 olddefconfig
           grep -qx 'CONFIG_BATTERY_QCOM_BATTMGR=y' linux/.config
           grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' linux/.config
