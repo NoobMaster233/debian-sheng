@@ -1,0 +1,152 @@
+From 20a5a29e808f34a8872ac48e1d3f35e6bf5876c2 Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 01:36:55 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: add inert sheng charge probes
+
+Expose current and maximum firmware charge-current limits as read-only
+power-supply properties on SM8550. Add read-only Xiaomi attributes for
+the charge-policy IDs observed in current sheng Android modules.
+
+The probe performs no request at driver load and adds no write path.
+Requests are sent only when an operator explicitly reads a new sysfs
+file. Propagate existing opcode 0x48 timeouts instead of reporting false
+successful threshold writes.
+
+This is a diagnostic patch, not a production implementation.
+---
+ drivers/power/supply/qcom_battmgr.c | 43 +++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 7d1ab5d..bf49aea 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -144,6 +144,7 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_BQ2597X_SLAVE_BATTERY_PRESENT	0x22
+ #define XM_BATT_BQ2597X_BATTERY_VOLTAGE		0x23
+ #define XM_BATT_FASTCHGMODE			0x2b
++#define XM_BATT_NIGHT_CHARGING			0x2c
+ #define XM_BATT_QUICK_CHARGE_TYPE		0x31
+ #define XM_BATT_APDO_MAX			0x32
+ #define XM_BATT_POWER_MAX			0x33
+@@ -157,12 +158,16 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_PEN_TX_SS			0x5a
+ #define XM_BATT_PEN_PLACE_ERR			0x5b
+ #define XM_BATT_PEN_FAKE_SS			0x5c
++#define XM_BATT_SMART_BATT			0x65
++#define XM_BATT_SMART_CHG			0x70
+ #define XM_BATT_FG1_RM				0x8a
+ #define XM_BATT_FG1_FCC			0x8b
+ #define XM_BATT_FG_FAST_CHARGE			0x8f
+ #define XM_BATT_SLAVE_AUTHENTIC		0xa5
+ #define XM_BATT_FG2_RM				0xa6
+ #define XM_BATT_FG2_FCC			0xa7
++#define XM_BATT_CHARGING_SUSPEND_BATTERY	0xdb
++#define XM_BATT_ENABLE_CHARGING			0xe1
+ #define XM_BATT_PPS_PTF			0xe7
+ 
+ struct qcom_battmgr_enable_request {
+@@ -332,6 +337,8 @@ struct qcom_battmgr_info {
+ 	unsigned int capacity_warning;
+ 	unsigned int cycle_count;
+ 	unsigned int charge_count;
++	unsigned int charge_current_limit;
++	unsigned int charge_current_limit_max;
+ 	unsigned int charge_ctrl_start;
+ 	unsigned int charge_ctrl_end;
+ 	char model_number[BATTMGR_STRING_LEN];
+@@ -701,6 +708,8 @@ static const u8 sm8350_bat_prop_map[] = {
+ 	[POWER_SUPPLY_PROP_VOLTAGE_NOW] = BATT_VOLT_NOW,
+ 	[POWER_SUPPLY_PROP_VOLTAGE_MAX] = BATT_VOLT_MAX,
+ 	[POWER_SUPPLY_PROP_CURRENT_NOW] = BATT_CURR_NOW,
++	[POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT] = BATT_CHG_CTRL_LIM,
++	[POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX] = BATT_CHG_CTRL_LIM_MAX,
+ 	[POWER_SUPPLY_PROP_TEMP] = BATT_TEMP,
+ 	[POWER_SUPPLY_PROP_TECHNOLOGY] = BATT_TECHNOLOGY,
+ 	[POWER_SUPPLY_PROP_CHARGE_COUNTER] =  BATT_CHG_COUNTER,
+@@ -902,6 +911,12 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
+ 		val->intval = battmgr->status.charge_time;
+ 		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		val->intval = battmgr->info.charge_current_limit;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		val->intval = battmgr->info.charge_current_limit_max;
++		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+ 		val->intval = battmgr->info.charge_ctrl_start;
+ 		break;
+@@ -978,7 +993,7 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -999,7 +1014,7 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -1446,6 +1461,17 @@ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall4, XM_BATT_PEN_HALL4, QCOM_BATTMGR_XIAOMI_DE
+ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_tx_ss, XM_BATT_PEN_TX_SS, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_place_err, XM_BATT_PEN_PLACE_ERR, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(fake_ss, XM_BATT_PEN_FAKE_SS, QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_night_charging, XM_BATT_NIGHT_CHARGING,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_smart_batt, XM_BATT_SMART_BATT,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_smart_chg, XM_BATT_SMART_CHG,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_charging_suspend_battery,
++			    XM_BATT_CHARGING_SUSPEND_BATTERY,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_enable_charging, XM_BATT_ENABLE_CHARGING,
++			    QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(slave_authentic, XM_BATT_SLAVE_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
+@@ -1481,6 +1507,11 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&qcom_battmgr_xiaomi_attr_pen_tx_ss.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pen_place_err.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_fake_ss.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_night_charging.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_smart_batt.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_smart_chg.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_charging_suspend_battery.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_enable_charging.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+@@ -1608,6 +1639,8 @@ static const enum power_supply_property sm8550_bat_props[] = {
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+ 	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+ 	POWER_SUPPLY_PROP_TEMP,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+ 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+@@ -2200,6 +2233,12 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			else
+ 				battmgr->status.current_now = le32_to_cpu(resp->intval.value);
+ 			break;
++		case BATT_CHG_CTRL_LIM:
++			battmgr->info.charge_current_limit = le32_to_cpu(resp->intval.value);
++			break;
++		case BATT_CHG_CTRL_LIM_MAX:
++			battmgr->info.charge_current_limit_max = le32_to_cpu(resp->intval.value);
++			break;
+ 		case BATT_TEMP:
+ 			val = le32_to_cpu(resp->intval.value);
+ 			battmgr->status.temperature = DIV_ROUND_CLOSEST(val, 10);
+-- 
+2.34.1
+
