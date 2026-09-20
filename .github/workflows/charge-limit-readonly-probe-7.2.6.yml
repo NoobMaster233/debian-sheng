@@ -37,7 +37,7 @@ jobs:
           ld.lld --version | head -n 1 | tee lld-version.txt
           llvm-nm --version | head -n 1 | tee llvm-nm-version.txt
           grep -Fx 'Debian clang version 21.1.8 (10)' clang-version.txt
-          grep -Fx 'Debian LLD 21.1.8' lld-version.txt
+          grep -E '^Debian LLD 21\.1\.8( |$)' lld-version.txt
 
       - name: Checkout exact workflow revision
         run: |
