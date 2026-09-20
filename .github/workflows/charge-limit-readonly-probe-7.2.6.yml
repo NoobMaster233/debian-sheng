@@ -10,7 +10,7 @@ jobs:
   build:
     name: Build pinned 7.2.6 read-only probe
     runs-on: ubuntu-24.04-arm
-    container: debian:trixie
+    container: debian:forky
     timeout-minutes: 180
 
     env:
