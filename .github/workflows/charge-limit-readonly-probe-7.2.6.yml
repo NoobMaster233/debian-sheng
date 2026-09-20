@@ -10,6 +10,7 @@ jobs:
   build:
     name: Build pinned 7.2.6 read-only probe
     runs-on: ubuntu-24.04-arm
+    container: debian:trixie
     timeout-minutes: 180
 
     env:
@@ -20,27 +21,40 @@ jobs:
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
-      - name: Checkout build files
-        uses: actions/checkout@v7
-
       - name: Install build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
+            ca-certificates git file xz-utils \
             build-essential flex bison libssl-dev libelf-dev bc \
             ccache clang llvm lld
           ccache --set-config=max_size=10G
           ccache --set-config=sloppiness=file_macro,locale,time_macros
 
+      - name: Verify Debian 21.1.8 toolchain
+        run: |
+          clang --version | head -n 1 | tee clang-version.txt
+          ld.lld --version | head -n 1 | tee lld-version.txt
+          llvm-nm --version | head -n 1 | tee llvm-nm-version.txt
+          grep -Fx 'Debian clang version 21.1.8 (10)' clang-version.txt
+          grep -Fx 'Debian LLD 21.1.8' lld-version.txt
+
+      - name: Checkout exact workflow revision
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: Restore compiler cache
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: charge-readonly-7.2.6-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch') }}
+          key: charge-readonly-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch') }}
           restore-keys: |
-            charge-readonly-7.2.6-
-            ccache-kernel-sheng-7.2.6-
-            ccache-kernel-
+            charge-readonly-7.2.6-clang21-
 
       - name: Fetch exact kernel baseline
         run: |
@@ -113,7 +127,8 @@ jobs:
         run: |
           mkdir -p out
           cp boot.img Image.gz-dtb_sheng checkpatch.txt \
-            qcom-battmgr-probe-symbols.txt out/
+            qcom-battmgr-probe-symbols.txt \
+            clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
           cp linux/System.map out/
           cp linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb out/
@@ -142,6 +157,7 @@ jobs:
             kernel.config kernel.patch \
             qcom-battmgr-readonly-charge-probe-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt checkpatch.txt \
+            clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
       - name: Upload probe artifact
