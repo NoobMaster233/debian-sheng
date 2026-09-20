@@ -1,0 +1,154 @@
+name: Build sheng 7.2.6 read-only charge probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build pinned 7.2.6 read-only probe
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    env:
+      KERNEL_REPO: https://github.com/ianchb/sm8550-mainline.git
+      KERNEL_BASE: 42f3b40c702abbc37c3a04c95af008cd283aeaf3
+      KERNEL_RELEASE: 7.2.6-sm8550-00103-g42f3b40c702a
+      PROBE_PATCH: patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch
+      BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
+
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison libssl-dev libelf-dev bc \
+            ccache clang llvm lld
+          ccache --set-config=max_size=10G
+          ccache --set-config=sloppiness=file_macro,locale,time_macros
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: charge-readonly-7.2.6-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch') }}
+          restore-keys: |
+            charge-readonly-7.2.6-
+            ccache-kernel-sheng-7.2.6-
+            ccache-kernel-
+
+      - name: Fetch exact kernel baseline
+        run: |
+          git init linux
+          git -C linux remote add origin "$KERNEL_REPO"
+          git -C linux fetch --depth 1 origin "$KERNEL_BASE"
+          git -C linux checkout --detach FETCH_HEAD
+          test "$(git -C linux rev-parse HEAD)" = "$KERNEL_BASE"
+
+      - name: Apply and lint inert probe
+        run: |
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${PROBE_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${PROBE_PATCH}"
+          git -C linux diff --check
+          linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
+            "${GITHUB_WORKSPACE}/${PROBE_PATCH}" | tee checkpatch.txt
+          grep -q '0 errors, 0 warnings' checkpatch.txt
+
+      - name: Configure boot-only probe
+        run: |
+          cp sm8550.config linux/.config
+          linux/scripts/config --file linux/.config --enable BATTERY_QCOM_BATTMGR
+          linux/scripts/config --file linux/.config --disable LOCALVERSION_AUTO
+          linux/scripts/config --file linux/.config \
+            --set-str LOCALVERSION '-sm8550-00103-g42f3b40c702a'
+          make -C linux ARCH=arm64 LLVM=1 LOCALVERSION= olddefconfig
+          grep -qx 'CONFIG_BATTERY_QCOM_BATTMGR=y' linux/.config
+          grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' linux/.config
+          grep -qx 'CONFIG_LOCALVERSION="-sm8550-00103-g42f3b40c702a"' linux/.config
+          actual_release="$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
+          echo "kernel_release=$actual_release"
+          test "$actual_release" = "$KERNEL_RELEASE"
+
+      - name: Build kernel
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          export PATH="/usr/lib/ccache:$PATH"
+          make -C linux -j"$(nproc)" ARCH=arm64 LLVM=1 LOCALVERSION=
+          test -s linux/arch/arm64/boot/Image.gz
+          test -s linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb
+          test -s linux/System.map
+          test -s linux/drivers/power/supply/qcom_battmgr.o
+          test ! -e linux/drivers/power/supply/qcom_battmgr.ko
+          grep -q ' qcom_battmgr_xiaomi_prop_show$' linux/System.map
+          grep -q ' qcom_battmgr_driver$' linux/System.map
+          llvm-nm -a linux/drivers/power/supply/qcom_battmgr.o | \
+            grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging)' \
+            > qcom-battmgr-probe-symbols.txt
+          test "$(wc -l < qcom-battmgr-probe-symbols.txt)" -ge 5
+
+      - name: Pack dual-boot boot image
+        run: |
+          cat linux/arch/arm64/boot/Image.gz \
+              linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb \
+            > Image.gz-dtb_sheng
+          chmod +x mkbootimg
+          ./mkbootimg \
+            --kernel Image.gz-dtb_sheng \
+            --cmdline "$BOOT_CMDLINE" \
+            --base 0x00000000 \
+            --kernel_offset 0x00008000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 4096 \
+            --id \
+            -o boot.img
+          test "$(stat -c %s boot.img)" -lt 201326592
+          test "$(dd if=boot.img bs=1 count=8 status=none)" = 'ANDROID!'
+
+      - name: Record provenance and checksums
+        run: |
+          mkdir -p out
+          cp boot.img Image.gz-dtb_sheng checkpatch.txt \
+            qcom-battmgr-probe-symbols.txt out/
+          cp linux/.config out/kernel.config
+          cp linux/System.map out/
+          cp linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb out/
+          cp "$PROBE_PATCH" out/
+          git -C linux diff > out/kernel.patch
+          {
+            echo "workflow_repository=${GITHUB_REPOSITORY}"
+            echo "workflow_commit=${GITHUB_SHA}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "kernel_repository=${KERNEL_REPO}"
+            echo "kernel_base=${KERNEL_BASE}"
+            echo "kernel_release=$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
+            echo "boot_cmdline=${BOOT_CMDLINE}"
+            echo "BATTERY_QCOM_BATTMGR=built-in"
+            echo "external_qcom_battmgr=blacklisted by boot cmdline"
+            echo "probe_policy=read-only; no new store path"
+          } > out/PROVENANCE.txt
+          {
+            file boot.img
+            stat -c 'boot_size=%s' boot.img
+            stat -c 'kernel_payload_size=%s' Image.gz-dtb_sheng
+            sha256sum boot.img Image.gz-dtb_sheng
+          } > out/BOOT_INFO.txt
+          (cd out && sha256sum \
+            boot.img Image.gz-dtb_sheng sm8550-xiaomi-sheng.dtb \
+            kernel.config kernel.patch \
+            qcom-battmgr-readonly-charge-probe-7.2.6.patch \
+            System.map qcom-battmgr-probe-symbols.txt checkpatch.txt \
+            PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sheng-7.2.6-charge-readonly-probe
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 1
