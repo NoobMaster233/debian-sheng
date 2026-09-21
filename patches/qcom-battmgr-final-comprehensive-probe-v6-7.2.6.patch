@@ -1,0 +1,418 @@
+From 97ca3c1983dcc3bead45676e9cc968eb1395e19d Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 23:05:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: add bounded thermal-level probes
+
+Complete the diagnostic image with the remaining plausible battery
+property 10 path. Read the firmware maximum level and provide separate
+root-only ten-second tests for maximum and penultimate levels. Restore the
+normal level zero before any other probe may run.
+
+Record SET and GET results and restore through timeout, manual request,
+retry, service return, removal, or shutdown. This finishes the compiled set
+of host-accessible charging primitives; driver load performs no test write.
+---
+ drivers/power/supply/qcom_battmgr.c | 292 +++++++++++++++++++++++++++-
+ 1 file changed, 289 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 02aead2..5f3274d 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -473,6 +473,20 @@ struct qcom_battmgr {
+ 	int usb_icl_test_restore_read_result;
+ 	int usb_icl_test_restore_result;
+ 	unsigned int usb_icl_test_restore_attempts;
++	struct delayed_work thermal_restore_work;
++	/* Serialize the thermal-level test and its restoration. */
++	struct mutex thermal_test_lock;
++	bool thermal_test_active;
++	u32 thermal_test_level;
++	u32 thermal_test_after_set_level;
++	u32 thermal_test_before_restore_level;
++	u32 thermal_test_after_restore_level;
++	int thermal_test_set_result;
++	int thermal_test_set_read_result;
++	int thermal_test_restore_set_result;
++	int thermal_test_restore_read_result;
++	int thermal_test_restore_result;
++	unsigned int thermal_test_restore_attempts;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -750,6 +764,74 @@ out_unlock:
+ 	mutex_unlock(&battmgr->fcc_test_lock);
+ }
+ 
++static int qcom_battmgr_restore_thermal_locked(struct qcom_battmgr *battmgr)
++{
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM, &value);
++	if (!ret)
++		battmgr->thermal_test_before_restore_level = value;
++
++	ret = qcom_battmgr_set_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM, 0);
++	battmgr->thermal_test_restore_set_result = ret;
++
++	read_ret = qcom_battmgr_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM,
++						       &value);
++	battmgr->thermal_test_restore_read_result = read_ret;
++	if (!read_ret)
++		battmgr->thermal_test_after_restore_level = value;
++
++	if (!read_ret && value == 0) {
++		battmgr->thermal_test_active = false;
++		ret = 0;
++		goto out_result;
++	}
++
++	if (!ret)
++		ret = read_ret ? read_ret : -EIO;
++
++out_result:
++	battmgr->thermal_test_restore_result = ret;
++	return ret;
++}
++
++static void qcom_battmgr_thermal_restore_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						       struct qcom_battmgr,
++						       thermal_restore_work);
++	int ret;
++
++	mutex_lock(&battmgr->thermal_test_lock);
++	if (!battmgr->thermal_test_active)
++		goto out_unlock;
++
++	battmgr->thermal_test_restore_attempts++;
++	ret = qcom_battmgr_restore_thermal_locked(battmgr);
++	if (!ret) {
++		dev_info(battmgr->dev, "thermal-level probe restored level 0\n");
++		goto out_unlock;
++	}
++
++	if (battmgr->thermal_test_restore_attempts <
++	    BATTMGR_FCC_RESTORE_MAX_ATTEMPTS) {
++		dev_warn(battmgr->dev,
++			 "thermal-level restore attempt %u failed: %d; retrying\n",
++			 battmgr->thermal_test_restore_attempts, ret);
++		mod_delayed_work(system_wq, &battmgr->thermal_restore_work,
++				 msecs_to_jiffies(BATTMGR_FCC_RESTORE_RETRY_MS));
++	} else {
++		dev_crit(battmgr->dev,
++			 "thermal-level restore failed after %u attempts: %d\n",
++			 battmgr->thermal_test_restore_attempts, ret);
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->thermal_test_lock);
++}
++
+ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, int opcode,
+ 						int property, u32 value, u32 *out_value)
+ {
+@@ -1837,7 +1919,8 @@ static ssize_t probe_fcc_zero_test_store(struct device *dev,
+ 
+ 	mutex_lock(&battmgr->fcc_test_lock);
+ 	if (battmgr->fcc_test_active || READ_ONCE(battmgr->private_test_active) ||
+-	    READ_ONCE(battmgr->usb_icl_test_active)) {
++	    READ_ONCE(battmgr->usb_icl_test_active) ||
++	    READ_ONCE(battmgr->thermal_test_active)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -1977,7 +2060,8 @@ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+ 
+ 	mutex_lock(&battmgr->private_test_lock);
+ 	if (battmgr->private_test_active || READ_ONCE(battmgr->fcc_test_active) ||
+-	    READ_ONCE(battmgr->usb_icl_test_active)) {
++	    READ_ONCE(battmgr->usb_icl_test_active) ||
++	    READ_ONCE(battmgr->thermal_test_active)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -2137,7 +2221,8 @@ static ssize_t probe_usb_icl_zero_test_store(struct device *dev,
+ 
+ 	mutex_lock(&battmgr->usb_icl_test_lock);
+ 	if (battmgr->usb_icl_test_active || READ_ONCE(battmgr->fcc_test_active) ||
+-	    READ_ONCE(battmgr->private_test_active)) {
++	    READ_ONCE(battmgr->private_test_active) ||
++	    READ_ONCE(battmgr->thermal_test_active)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -2219,6 +2304,162 @@ out_unlock:
+ 	return ret ? ret : count;
+ }
+ 
++static ssize_t probe_thermal_test_status_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&battmgr->thermal_test_lock);
++	len = sysfs_emit(buf, "active=%u test_level=%u set_result=%d\n",
++			 battmgr->thermal_test_active,
++			 battmgr->thermal_test_level,
++			 battmgr->thermal_test_set_result);
++	len += sysfs_emit_at(buf, len, "set_read_result=%d after_set_level=%u\n",
++			 battmgr->thermal_test_set_read_result,
++			 battmgr->thermal_test_after_set_level);
++	len += sysfs_emit_at(buf, len,
++			     "before_restore_level=%u restore_result=%d\n",
++			     battmgr->thermal_test_before_restore_level,
++			     battmgr->thermal_test_restore_result);
++	len += sysfs_emit_at(buf, len,
++			     "restore_set_result=%d restore_read_result=%d\n",
++			     battmgr->thermal_test_restore_set_result,
++			     battmgr->thermal_test_restore_read_result);
++	len += sysfs_emit_at(buf, len, "after_restore_level=%u attempts=%u\n",
++			     battmgr->thermal_test_after_restore_level,
++			     battmgr->thermal_test_restore_attempts);
++	mutex_unlock(&battmgr->thermal_test_lock);
++
++	return len;
++}
++
++static ssize_t qcom_battmgr_thermal_test_store(struct device *dev,
++					       bool penultimate,
++					       const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 trigger;
++	u32 max_level;
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->thermal_test_lock);
++	if (battmgr->thermal_test_active || READ_ONCE(battmgr->fcc_test_active) ||
++	    READ_ONCE(battmgr->private_test_active) ||
++	    READ_ONCE(battmgr->usb_icl_test_active)) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM, &value);
++	if (ret)
++		goto out_unlock;
++	if (value != 0) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM_MAX, &max_level);
++	if (ret)
++		goto out_unlock;
++	if (max_level < 2) {
++		ret = -ERANGE;
++		goto out_unlock;
++	}
++
++	battmgr->thermal_test_level = max_level - (penultimate ? 1 : 0);
++	battmgr->thermal_test_after_set_level = U32_MAX;
++	battmgr->thermal_test_before_restore_level = U32_MAX;
++	battmgr->thermal_test_after_restore_level = U32_MAX;
++	battmgr->thermal_test_set_result = -EINPROGRESS;
++	battmgr->thermal_test_set_read_result = -EINPROGRESS;
++	battmgr->thermal_test_restore_set_result = -EINPROGRESS;
++	battmgr->thermal_test_restore_read_result = -EINPROGRESS;
++	battmgr->thermal_test_restore_result = -EINPROGRESS;
++	battmgr->thermal_test_restore_attempts = 0;
++	battmgr->thermal_test_active = true;
++
++	mod_delayed_work(system_wq, &battmgr->thermal_restore_work,
++			 msecs_to_jiffies(BATTMGR_PRIVATE_TEST_DURATION_MS));
++
++	ret = qcom_battmgr_set_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM,
++						      battmgr->thermal_test_level);
++	battmgr->thermal_test_set_result = ret;
++	read_ret = qcom_battmgr_probe_battery_property(battmgr, BATT_CHG_CTRL_LIM,
++						       &value);
++	battmgr->thermal_test_set_read_result = read_ret;
++	if (!read_ret)
++		battmgr->thermal_test_after_set_level = value;
++
++	if (ret || read_ret || value != battmgr->thermal_test_level) {
++		mod_delayed_work(system_wq, &battmgr->thermal_restore_work, 0);
++		if (!ret)
++			ret = read_ret ? read_ret : -EIO;
++		goto out_unlock;
++	}
++
++	dev_info(battmgr->dev,
++		 "thermal-level probe %u armed for %u ms; restore=0\n",
++		 battmgr->thermal_test_level, BATTMGR_PRIVATE_TEST_DURATION_MS);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->thermal_test_lock);
++	return ret ? ret : count;
++}
++
++static ssize_t probe_thermal_level_max_test_store(struct device *dev,
++						  struct device_attribute *attr,
++						  const char *buf, size_t count)
++{
++	return qcom_battmgr_thermal_test_store(dev, false, buf, count);
++}
++
++static ssize_t probe_thermal_level_penultimate_test_store(struct device *dev,
++							  struct device_attribute *attr,
++							  const char *buf, size_t count)
++{
++	return qcom_battmgr_thermal_test_store(dev, true, buf, count);
++}
++
++static ssize_t probe_thermal_restore_now_store(struct device *dev,
++					       struct device_attribute *attr,
++					       const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 trigger;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->thermal_test_lock);
++	if (!battmgr->thermal_test_active) {
++		ret = -EALREADY;
++		goto out_unlock;
++	}
++
++	battmgr->thermal_test_restore_attempts = 0;
++	mod_delayed_work(system_wq, &battmgr->thermal_restore_work, 0);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->thermal_test_lock);
++	return ret ? ret : count;
++}
++
+ static DEVICE_ATTR_RO(probe_fcc_test_status);
+ static DEVICE_ATTR_WO(probe_fcc_zero_test);
+ static DEVICE_ATTR_WO(probe_fcc_restore_now);
+@@ -2230,6 +2471,10 @@ static DEVICE_ATTR_WO(probe_private_restore_now);
+ static DEVICE_ATTR_RO(probe_usb_icl_test_status);
+ static DEVICE_ATTR_WO(probe_usb_icl_zero_test);
+ static DEVICE_ATTR_WO(probe_usb_icl_restore_now);
++static DEVICE_ATTR_RO(probe_thermal_test_status);
++static DEVICE_ATTR_WO(probe_thermal_level_max_test);
++static DEVICE_ATTR_WO(probe_thermal_level_penultimate_test);
++static DEVICE_ATTR_WO(probe_thermal_restore_now);
+ 
+ #define QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(_name, _prop)		\
+ 	static struct qcom_battmgr_battery_probe_attr qcom_battmgr_battery_probe_attr_##_name = { \
+@@ -2369,6 +2614,10 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&dev_attr_probe_usb_icl_test_status.attr,
+ 	&dev_attr_probe_usb_icl_zero_test.attr,
+ 	&dev_attr_probe_usb_icl_restore_now.attr,
++	&dev_attr_probe_thermal_test_status.attr,
++	&dev_attr_probe_thermal_level_max_test.attr,
++	&dev_attr_probe_thermal_level_penultimate_test.attr,
++	&dev_attr_probe_thermal_restore_now.attr,
+ 	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+@@ -3285,6 +3534,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 			mod_delayed_work(system_wq, &battmgr->private_restore_work, 0);
+ 		if (READ_ONCE(battmgr->usb_icl_test_active))
+ 			mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work, 0);
++		if (READ_ONCE(battmgr->thermal_test_active))
++			mod_delayed_work(system_wq, &battmgr->thermal_restore_work, 0);
+ 	} else {
+ 		battmgr->service_up = false;
+ 	}
+@@ -3334,6 +3585,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	mutex_init(&battmgr->fcc_test_lock);
+ 	mutex_init(&battmgr->private_test_lock);
+ 	mutex_init(&battmgr->usb_icl_test_lock);
++	mutex_init(&battmgr->thermal_test_lock);
+ 	init_completion(&battmgr->ack);
+ 	battmgr->fcc_test_after_set_ua = U32_MAX;
+ 	battmgr->fcc_test_before_restore_ua = U32_MAX;
+@@ -3359,6 +3611,14 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	battmgr->usb_icl_test_restore_set_result = -ENODATA;
+ 	battmgr->usb_icl_test_restore_read_result = -ENODATA;
+ 	battmgr->usb_icl_test_restore_result = -ENODATA;
++	battmgr->thermal_test_after_set_level = U32_MAX;
++	battmgr->thermal_test_before_restore_level = U32_MAX;
++	battmgr->thermal_test_after_restore_level = U32_MAX;
++	battmgr->thermal_test_set_result = -ENODATA;
++	battmgr->thermal_test_set_read_result = -ENODATA;
++	battmgr->thermal_test_restore_set_result = -ENODATA;
++	battmgr->thermal_test_restore_read_result = -ENODATA;
++	battmgr->thermal_test_restore_result = -ENODATA;
+ 
+ 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
+ 	if (match)
+@@ -3384,6 +3644,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 						   qcom_battmgr_usb_icl_restore_worker);
+ 		if (ret)
+ 			return ret;
++		ret = devm_delayed_work_autocancel(dev, &battmgr->thermal_restore_work,
++						   qcom_battmgr_thermal_restore_worker);
++		if (ret)
++			return ret;
+ 
+ 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+ 		if (ret < 0)
+@@ -3525,10 +3789,31 @@ static void qcom_battmgr_finish_usb_icl_probe(struct qcom_battmgr *battmgr)
+ 	mutex_unlock(&battmgr->usb_icl_test_lock);
+ }
+ 
++static void qcom_battmgr_finish_thermal_probe(struct qcom_battmgr *battmgr)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return;
++
++	cancel_delayed_work_sync(&battmgr->thermal_restore_work);
++
++	mutex_lock(&battmgr->thermal_test_lock);
++	if (battmgr->thermal_test_active) {
++		ret = qcom_battmgr_restore_thermal_locked(battmgr);
++		if (ret)
++			dev_crit(battmgr->dev,
++				 "failed to restore thermal level while stopping driver: %d\n",
++				 ret);
++	}
++	mutex_unlock(&battmgr->thermal_test_lock);
++}
++
+ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 
++	qcom_battmgr_finish_thermal_probe(battmgr);
+ 	qcom_battmgr_finish_usb_icl_probe(battmgr);
+ 	qcom_battmgr_finish_private_probe(battmgr);
+ 	qcom_battmgr_finish_fcc_probe(battmgr);
+@@ -3538,6 +3823,7 @@ static void qcom_battmgr_shutdown(struct auxiliary_device *adev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 
++	qcom_battmgr_finish_thermal_probe(battmgr);
+ 	qcom_battmgr_finish_usb_icl_probe(battmgr);
+ 	qcom_battmgr_finish_private_probe(battmgr);
+ 	qcom_battmgr_finish_fcc_probe(battmgr);
+-- 
+2.34.1
+
