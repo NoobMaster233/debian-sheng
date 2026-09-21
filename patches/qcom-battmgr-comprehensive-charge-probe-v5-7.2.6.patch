@@ -1,0 +1,521 @@
+From 1fd6449855ba1615945d048f0a0a418c16c0f602 Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 22:55:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: complete charge primitive probes
+
+Extend the bounded diagnostics to cover the remaining host-controlled
+charge candidates in one image: enable_charging command semantics and USB
+input-current-limit zero, alongside the existing FCC, input_suspend, and
+charging_suspend_battery probes.
+
+Every test is root-only, mutually exclusive, fixed to ten seconds, and
+schedules restoration before the test write. Record SET/GET outcomes and
+restore on timeout, manual request, retry, service return, removal, or
+shutdown. Driver load performs no test write.
+---
+ drivers/power/supply/qcom_battmgr.c | 334 +++++++++++++++++++++++++++-
+ 1 file changed, 323 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 7a08496..02aead2 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -449,6 +449,7 @@ struct qcom_battmgr {
+ 	u32 private_test_property;
+ 	u32 private_test_value;
+ 	u32 private_test_restore_value;
++	bool private_test_require_readback;
+ 	u32 private_test_after_set_value;
+ 	u32 private_test_before_restore_value;
+ 	u32 private_test_after_restore_value;
+@@ -458,6 +459,20 @@ struct qcom_battmgr {
+ 	int private_test_restore_read_result;
+ 	int private_test_restore_result;
+ 	unsigned int private_test_restore_attempts;
++	struct delayed_work usb_icl_restore_work;
++	/* Serialize the USB ICL test and its restoration. */
++	struct mutex usb_icl_test_lock;
++	bool usb_icl_test_active;
++	u32 usb_icl_test_saved_ua;
++	u32 usb_icl_test_after_set_ua;
++	u32 usb_icl_test_before_restore_ua;
++	u32 usb_icl_test_after_restore_ua;
++	int usb_icl_test_set_result;
++	int usb_icl_test_set_read_result;
++	int usb_icl_test_restore_set_result;
++	int usb_icl_test_restore_read_result;
++	int usb_icl_test_restore_result;
++	unsigned int usb_icl_test_restore_attempts;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -506,6 +521,111 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
++static int qcom_battmgr_get_usb_icl(struct qcom_battmgr *battmgr, u32 *value)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return -EOPNOTSUPP;
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					    USB_INPUT_CURR_LIMIT, 0);
++	if (!ret)
++		*value = battmgr->usb.current_limit;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_set_usb_icl(struct qcom_battmgr *battmgr, u32 value)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return -EOPNOTSUPP;
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++					    USB_INPUT_CURR_LIMIT, value);
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_restore_usb_icl_locked(struct qcom_battmgr *battmgr)
++{
++	u32 saved_ua = battmgr->usb_icl_test_saved_ua;
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = qcom_battmgr_get_usb_icl(battmgr, &value);
++	if (!ret)
++		battmgr->usb_icl_test_before_restore_ua = value;
++
++	ret = qcom_battmgr_set_usb_icl(battmgr, saved_ua);
++	battmgr->usb_icl_test_restore_set_result = ret;
++
++	read_ret = qcom_battmgr_get_usb_icl(battmgr, &value);
++	battmgr->usb_icl_test_restore_read_result = read_ret;
++	if (!read_ret)
++		battmgr->usb_icl_test_after_restore_ua = value;
++
++	if (!read_ret && value == saved_ua) {
++		battmgr->usb_icl_test_active = false;
++		ret = 0;
++		goto out_result;
++	}
++
++	if (!ret)
++		ret = read_ret ? read_ret : -EIO;
++
++out_result:
++	battmgr->usb_icl_test_restore_result = ret;
++	return ret;
++}
++
++static void qcom_battmgr_usb_icl_restore_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						       struct qcom_battmgr,
++						       usb_icl_restore_work);
++	int ret;
++
++	mutex_lock(&battmgr->usb_icl_test_lock);
++	if (!battmgr->usb_icl_test_active)
++		goto out_unlock;
++
++	battmgr->usb_icl_test_restore_attempts++;
++	ret = qcom_battmgr_restore_usb_icl_locked(battmgr);
++	if (!ret) {
++		dev_info(battmgr->dev, "USB ICL probe restored %u uA\n",
++			 battmgr->usb_icl_test_after_restore_ua);
++		goto out_unlock;
++	}
++
++	if (battmgr->usb_icl_test_restore_attempts <
++	    BATTMGR_FCC_RESTORE_MAX_ATTEMPTS) {
++		dev_warn(battmgr->dev,
++			 "USB ICL restore attempt %u failed: %d; retrying\n",
++			 battmgr->usb_icl_test_restore_attempts, ret);
++		mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work,
++				 msecs_to_jiffies(BATTMGR_FCC_RESTORE_RETRY_MS));
++	} else {
++		dev_crit(battmgr->dev,
++			 "USB ICL restore failed after %u attempts: %d\n",
++			 battmgr->usb_icl_test_restore_attempts, ret);
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->usb_icl_test_lock);
++}
++
+ static int qcom_battmgr_probe_battery_property(struct qcom_battmgr *battmgr,
+ 					       int property, u32 *out_value)
+ {
+@@ -693,7 +813,8 @@ static int qcom_battmgr_restore_private_locked(struct qcom_battmgr *battmgr)
+ 	if (!read_ret)
+ 		battmgr->private_test_after_restore_value = value;
+ 
+-	if (!read_ret && value == restore_value) {
++	if ((!read_ret && value == restore_value) ||
++	    (!battmgr->private_test_require_readback && !ret)) {
+ 		battmgr->private_test_active = false;
+ 		ret = 0;
+ 		goto out_result;
+@@ -1715,7 +1836,8 @@ static ssize_t probe_fcc_zero_test_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&battmgr->fcc_test_lock);
+-	if (battmgr->fcc_test_active || READ_ONCE(battmgr->private_test_active)) {
++	if (battmgr->fcc_test_active || READ_ONCE(battmgr->private_test_active) ||
++	    READ_ONCE(battmgr->usb_icl_test_active)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -1808,11 +1930,13 @@ static ssize_t probe_private_test_status_show(struct device *dev,
+ 	ssize_t len;
+ 
+ 	mutex_lock(&battmgr->private_test_lock);
+-	len = sysfs_emit(buf, "active=%u property=%#x test=%u restore=%u\n",
++	len = sysfs_emit(buf,
++			 "active=%u property=%#x test=%u restore=%u require_readback=%u\n",
+ 			 battmgr->private_test_active,
+ 			 battmgr->private_test_property,
+ 			 battmgr->private_test_value,
+-			 battmgr->private_test_restore_value);
++			 battmgr->private_test_restore_value,
++			 battmgr->private_test_require_readback);
+ 	len += sysfs_emit_at(buf, len, "set_result=%d set_read_result=%d after_set=%u\n",
+ 			 battmgr->private_test_set_result,
+ 			 battmgr->private_test_set_read_result,
+@@ -1834,8 +1958,9 @@ static ssize_t probe_private_test_status_show(struct device *dev,
+ }
+ 
+ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+-					       u32 property, u32 test_value,
+-					       u32 restore_value,
++					       u32 property, u32 baseline_value,
++					       u32 test_value, u32 restore_value,
++					       bool require_readback,
+ 					       const char *buf, size_t count)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+@@ -1851,7 +1976,8 @@ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&battmgr->private_test_lock);
+-	if (battmgr->private_test_active || READ_ONCE(battmgr->fcc_test_active)) {
++	if (battmgr->private_test_active || READ_ONCE(battmgr->fcc_test_active) ||
++	    READ_ONCE(battmgr->usb_icl_test_active)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -1859,7 +1985,7 @@ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+ 	ret = qcom_battmgr_get_xiaomi_property(battmgr, property, &value);
+ 	if (ret)
+ 		goto out_unlock;
+-	if (value != restore_value) {
++	if (value != baseline_value) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -1867,6 +1993,7 @@ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+ 	battmgr->private_test_property = property;
+ 	battmgr->private_test_value = test_value;
+ 	battmgr->private_test_restore_value = restore_value;
++	battmgr->private_test_require_readback = require_readback;
+ 	battmgr->private_test_after_set_value = U32_MAX;
+ 	battmgr->private_test_before_restore_value = U32_MAX;
+ 	battmgr->private_test_after_restore_value = U32_MAX;
+@@ -1888,7 +2015,7 @@ static ssize_t qcom_battmgr_private_test_store(struct device *dev,
+ 	if (!read_ret)
+ 		battmgr->private_test_after_set_value = value;
+ 
+-	if (ret || read_ret || value != test_value) {
++	if (ret || (require_readback && (read_ret || value != test_value))) {
+ 		mod_delayed_work(system_wq, &battmgr->private_restore_work, 0);
+ 		if (!ret)
+ 			ret = read_ret ? read_ret : -EIO;
+@@ -1911,7 +2038,7 @@ static ssize_t probe_input_suspend_test_store(struct device *dev,
+ 					      const char *buf, size_t count)
+ {
+ 	return qcom_battmgr_private_test_store(dev, XM_BATT_INPUT_SUSPEND,
+-						  1, 0, buf, count);
++						  0, 1, 0, true, buf, count);
+ }
+ 
+ static ssize_t probe_charging_suspend_test_store(struct device *dev,
+@@ -1920,7 +2047,16 @@ static ssize_t probe_charging_suspend_test_store(struct device *dev,
+ {
+ 	u32 property = XM_BATT_CHARGING_SUSPEND_BATTERY;
+ 
+-	return qcom_battmgr_private_test_store(dev, property, 1, 0, buf, count);
++	return qcom_battmgr_private_test_store(dev, property, 0, 1, 0, true,
++						  buf, count);
++}
++
++static ssize_t probe_enable_charging_test_store(struct device *dev,
++						struct device_attribute *attr,
++						const char *buf, size_t count)
++{
++	return qcom_battmgr_private_test_store(dev, XM_BATT_ENABLE_CHARGING,
++						  0, 0, 1, false, buf, count);
+ }
+ 
+ static ssize_t probe_private_restore_now_store(struct device *dev,
+@@ -1952,13 +2088,148 @@ out_unlock:
+ 	return ret ? ret : count;
+ }
+ 
++static ssize_t probe_usb_icl_test_status_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&battmgr->usb_icl_test_lock);
++	len = sysfs_emit(buf, "active=%u saved_ua=%u set_result=%d\n",
++			 battmgr->usb_icl_test_active,
++			 battmgr->usb_icl_test_saved_ua,
++			 battmgr->usb_icl_test_set_result);
++	len += sysfs_emit_at(buf, len, "set_read_result=%d after_set_ua=%u\n",
++			 battmgr->usb_icl_test_set_read_result,
++			 battmgr->usb_icl_test_after_set_ua);
++	len += sysfs_emit_at(buf, len,
++			     "before_restore_ua=%u restore_result=%d\n",
++			     battmgr->usb_icl_test_before_restore_ua,
++			     battmgr->usb_icl_test_restore_result);
++	len += sysfs_emit_at(buf, len,
++			     "restore_set_result=%d restore_read_result=%d\n",
++			     battmgr->usb_icl_test_restore_set_result,
++			     battmgr->usb_icl_test_restore_read_result);
++	len += sysfs_emit_at(buf, len, "after_restore_ua=%u attempts=%u\n",
++			     battmgr->usb_icl_test_after_restore_ua,
++			     battmgr->usb_icl_test_restore_attempts);
++	mutex_unlock(&battmgr->usb_icl_test_lock);
++
++	return len;
++}
++
++static ssize_t probe_usb_icl_zero_test_store(struct device *dev,
++					     struct device_attribute *attr,
++					     const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 trigger;
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->usb_icl_test_lock);
++	if (battmgr->usb_icl_test_active || READ_ONCE(battmgr->fcc_test_active) ||
++	    READ_ONCE(battmgr->private_test_active)) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_get_usb_icl(battmgr, &value);
++	if (ret)
++		goto out_unlock;
++	if (!value || value > BATTMGR_FCC_TEST_MAX_UA) {
++		ret = -ERANGE;
++		goto out_unlock;
++	}
++
++	battmgr->usb_icl_test_saved_ua = value;
++	battmgr->usb_icl_test_after_set_ua = U32_MAX;
++	battmgr->usb_icl_test_before_restore_ua = U32_MAX;
++	battmgr->usb_icl_test_after_restore_ua = U32_MAX;
++	battmgr->usb_icl_test_set_result = -EINPROGRESS;
++	battmgr->usb_icl_test_set_read_result = -EINPROGRESS;
++	battmgr->usb_icl_test_restore_set_result = -EINPROGRESS;
++	battmgr->usb_icl_test_restore_read_result = -EINPROGRESS;
++	battmgr->usb_icl_test_restore_result = -EINPROGRESS;
++	battmgr->usb_icl_test_restore_attempts = 0;
++	battmgr->usb_icl_test_active = true;
++
++	mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work,
++			 msecs_to_jiffies(BATTMGR_PRIVATE_TEST_DURATION_MS));
++
++	ret = qcom_battmgr_set_usb_icl(battmgr, 0);
++	battmgr->usb_icl_test_set_result = ret;
++	read_ret = qcom_battmgr_get_usb_icl(battmgr, &value);
++	battmgr->usb_icl_test_set_read_result = read_ret;
++	if (!read_ret)
++		battmgr->usb_icl_test_after_set_ua = value;
++
++	if (ret || read_ret || value != 0) {
++		mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work, 0);
++		if (!ret)
++			ret = read_ret ? read_ret : -EIO;
++		goto out_unlock;
++	}
++
++	dev_info(battmgr->dev,
++		 "USB ICL zero probe armed for %u ms; restore=%u uA\n",
++		 BATTMGR_PRIVATE_TEST_DURATION_MS,
++		 battmgr->usb_icl_test_saved_ua);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->usb_icl_test_lock);
++	return ret ? ret : count;
++}
++
++static ssize_t probe_usb_icl_restore_now_store(struct device *dev,
++					       struct device_attribute *attr,
++					       const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 trigger;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->usb_icl_test_lock);
++	if (!battmgr->usb_icl_test_active) {
++		ret = -EALREADY;
++		goto out_unlock;
++	}
++
++	battmgr->usb_icl_test_restore_attempts = 0;
++	mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work, 0);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->usb_icl_test_lock);
++	return ret ? ret : count;
++}
++
+ static DEVICE_ATTR_RO(probe_fcc_test_status);
+ static DEVICE_ATTR_WO(probe_fcc_zero_test);
+ static DEVICE_ATTR_WO(probe_fcc_restore_now);
+ static DEVICE_ATTR_RO(probe_private_test_status);
+ static DEVICE_ATTR_WO(probe_input_suspend_test);
+ static DEVICE_ATTR_WO(probe_charging_suspend_test);
++static DEVICE_ATTR_WO(probe_enable_charging_test);
+ static DEVICE_ATTR_WO(probe_private_restore_now);
++static DEVICE_ATTR_RO(probe_usb_icl_test_status);
++static DEVICE_ATTR_WO(probe_usb_icl_zero_test);
++static DEVICE_ATTR_WO(probe_usb_icl_restore_now);
+ 
+ #define QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(_name, _prop)		\
+ 	static struct qcom_battmgr_battery_probe_attr qcom_battmgr_battery_probe_attr_##_name = { \
+@@ -2093,7 +2364,11 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&dev_attr_probe_private_test_status.attr,
+ 	&dev_attr_probe_input_suspend_test.attr,
+ 	&dev_attr_probe_charging_suspend_test.attr,
++	&dev_attr_probe_enable_charging_test.attr,
+ 	&dev_attr_probe_private_restore_now.attr,
++	&dev_attr_probe_usb_icl_test_status.attr,
++	&dev_attr_probe_usb_icl_zero_test.attr,
++	&dev_attr_probe_usb_icl_restore_now.attr,
+ 	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+@@ -3008,6 +3283,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 			mod_delayed_work(system_wq, &battmgr->fcc_restore_work, 0);
+ 		if (READ_ONCE(battmgr->private_test_active))
+ 			mod_delayed_work(system_wq, &battmgr->private_restore_work, 0);
++		if (READ_ONCE(battmgr->usb_icl_test_active))
++			mod_delayed_work(system_wq, &battmgr->usb_icl_restore_work, 0);
+ 	} else {
+ 		battmgr->service_up = false;
+ 	}
+@@ -3056,6 +3333,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	mutex_init(&battmgr->lock);
+ 	mutex_init(&battmgr->fcc_test_lock);
+ 	mutex_init(&battmgr->private_test_lock);
++	mutex_init(&battmgr->usb_icl_test_lock);
+ 	init_completion(&battmgr->ack);
+ 	battmgr->fcc_test_after_set_ua = U32_MAX;
+ 	battmgr->fcc_test_before_restore_ua = U32_MAX;
+@@ -3073,6 +3351,14 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	battmgr->private_test_restore_set_result = -ENODATA;
+ 	battmgr->private_test_restore_read_result = -ENODATA;
+ 	battmgr->private_test_restore_result = -ENODATA;
++	battmgr->usb_icl_test_after_set_ua = U32_MAX;
++	battmgr->usb_icl_test_before_restore_ua = U32_MAX;
++	battmgr->usb_icl_test_after_restore_ua = U32_MAX;
++	battmgr->usb_icl_test_set_result = -ENODATA;
++	battmgr->usb_icl_test_set_read_result = -ENODATA;
++	battmgr->usb_icl_test_restore_set_result = -ENODATA;
++	battmgr->usb_icl_test_restore_read_result = -ENODATA;
++	battmgr->usb_icl_test_restore_result = -ENODATA;
+ 
+ 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
+ 	if (match)
+@@ -3094,6 +3380,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 						   qcom_battmgr_private_restore_worker);
+ 		if (ret)
+ 			return ret;
++		ret = devm_delayed_work_autocancel(dev, &battmgr->usb_icl_restore_work,
++						   qcom_battmgr_usb_icl_restore_worker);
++		if (ret)
++			return ret;
+ 
+ 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+ 		if (ret < 0)
+@@ -3215,10 +3505,31 @@ static void qcom_battmgr_finish_private_probe(struct qcom_battmgr *battmgr)
+ 	mutex_unlock(&battmgr->private_test_lock);
+ }
+ 
++static void qcom_battmgr_finish_usb_icl_probe(struct qcom_battmgr *battmgr)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return;
++
++	cancel_delayed_work_sync(&battmgr->usb_icl_restore_work);
++
++	mutex_lock(&battmgr->usb_icl_test_lock);
++	if (battmgr->usb_icl_test_active) {
++		ret = qcom_battmgr_restore_usb_icl_locked(battmgr);
++		if (ret)
++			dev_crit(battmgr->dev,
++				 "failed to restore USB ICL while stopping driver: %d\n",
++				 ret);
++	}
++	mutex_unlock(&battmgr->usb_icl_test_lock);
++}
++
+ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 
++	qcom_battmgr_finish_usb_icl_probe(battmgr);
+ 	qcom_battmgr_finish_private_probe(battmgr);
+ 	qcom_battmgr_finish_fcc_probe(battmgr);
+ }
+@@ -3227,6 +3538,7 @@ static void qcom_battmgr_shutdown(struct auxiliary_device *adev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 
++	qcom_battmgr_finish_usb_icl_probe(battmgr);
+ 	qcom_battmgr_finish_private_probe(battmgr);
+ 	qcom_battmgr_finish_fcc_probe(battmgr);
+ }
+-- 
+2.34.1
+
