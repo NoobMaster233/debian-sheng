@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 read-only charge probe
+name: Build sheng 7.2.6 read-only charge probe v2
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 read-only probe
+    name: Build pinned 7.2.6 read-only probe v2
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -17,7 +17,7 @@ jobs:
       KERNEL_REPO: https://github.com/ianchb/sm8550-mainline.git
       KERNEL_BASE: 42f3b40c702abbc37c3a04c95af008cd283aeaf3
       KERNEL_RELEASE: 7.2.6-sm8550-00103-g42f3b40c702a
-      PROBE_PATCH: patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch
+      PROBE_PATCH: patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -52,8 +52,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: charge-readonly-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-7.2.6.patch') }}
+          key: charge-readonly-v2-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch') }}
           restore-keys: |
+            charge-readonly-v2-7.2.6-clang21-
             charge-readonly-7.2.6-clang21-
 
       - name: Fetch exact kernel baseline
@@ -101,9 +102,9 @@ jobs:
           grep -q ' qcom_battmgr_xiaomi_prop_show$' linux/System.map
           grep -q ' qcom_battmgr_driver$' linux/System.map
           llvm-nm -a linux/drivers/power/supply/qcom_battmgr.o | \
-            grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging)' \
+            grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging|charge_control_limit|charge_control_limit_max|constant_charge_current)' \
             > qcom-battmgr-probe-symbols.txt
-          test "$(wc -l < qcom-battmgr-probe-symbols.txt)" -ge 5
+          test "$(wc -l < qcom-battmgr-probe-symbols.txt)" -ge 8
 
       - name: Pack dual-boot boot image
         run: |
@@ -144,6 +145,8 @@ jobs:
             echo "boot_cmdline=${BOOT_CMDLINE}"
             echo "BATTERY_QCOM_BATTMGR=built-in"
             echo "external_qcom_battmgr=blacklisted by boot cmdline"
+            echo "probe_version=v2"
+            echo "raw_battery_properties=10,11,12"
             echo "probe_policy=read-only; no new store path"
           } > out/PROVENANCE.txt
           {
@@ -155,7 +158,7 @@ jobs:
           (cd out && sha256sum \
             boot.img Image.gz-dtb_sheng sm8550-xiaomi-sheng.dtb \
             kernel.config kernel.patch \
-            qcom-battmgr-readonly-charge-probe-7.2.6.patch \
+            qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt checkpatch.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
@@ -163,7 +166,7 @@ jobs:
       - name: Upload probe artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-charge-readonly-probe
+          name: sheng-7.2.6-charge-readonly-probe-v2
           path: out/
           retention-days: 14
           if-no-files-found: error

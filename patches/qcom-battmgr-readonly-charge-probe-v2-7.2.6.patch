@@ -1,0 +1,217 @@
+From 2ec599839a65fdfe1bc75a725be1a00a7fe41eb7 Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 10:00:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: add raw sheng charge probes
+
+Expose raw battery properties 10, 11 and Xiaomi property 12 through
+isolated read-only diagnostic attributes. This distinguishes the thermal
+mitigation level from the vendor constant-current field without adding a
+store path.
+
+Keep the existing read-only Xiaomi property probes and propagate
+opcode 0x48 errors instead of reporting false threshold-write success.
+No diagnostic request is sent at driver load.
+---
+ drivers/power/supply/qcom_battmgr.c | 110 +++++++++++++++++++++++++++-
+ 1 file changed, 108 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 7d1ab5d..e00bf48 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -64,6 +64,7 @@ enum qcom_battmgr_variant {
+ #define BATT_CURR_NOW			9
+ #define BATT_CHG_CTRL_LIM		10
+ #define BATT_CHG_CTRL_LIM_MAX		11
++#define BATT_XIAOMI_CONSTANT_CURRENT	12
+ #define BATT_TEMP			12
+ #define BATT_TECHNOLOGY			13
+ #define BATT_CHG_COUNTER		14
+@@ -144,6 +145,7 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_BQ2597X_SLAVE_BATTERY_PRESENT	0x22
+ #define XM_BATT_BQ2597X_BATTERY_VOLTAGE		0x23
+ #define XM_BATT_FASTCHGMODE			0x2b
++#define XM_BATT_NIGHT_CHARGING			0x2c
+ #define XM_BATT_QUICK_CHARGE_TYPE		0x31
+ #define XM_BATT_APDO_MAX			0x32
+ #define XM_BATT_POWER_MAX			0x33
+@@ -157,12 +159,16 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_PEN_TX_SS			0x5a
+ #define XM_BATT_PEN_PLACE_ERR			0x5b
+ #define XM_BATT_PEN_FAKE_SS			0x5c
++#define XM_BATT_SMART_BATT			0x65
++#define XM_BATT_SMART_CHG			0x70
+ #define XM_BATT_FG1_RM				0x8a
+ #define XM_BATT_FG1_FCC			0x8b
+ #define XM_BATT_FG_FAST_CHARGE			0x8f
+ #define XM_BATT_SLAVE_AUTHENTIC		0xa5
+ #define XM_BATT_FG2_RM				0xa6
+ #define XM_BATT_FG2_FCC			0xa7
++#define XM_BATT_CHARGING_SUSPEND_BATTERY	0xdb
++#define XM_BATT_ENABLE_CHARGING			0xe1
+ #define XM_BATT_PPS_PTF			0xe7
+ 
+ struct qcom_battmgr_enable_request {
+@@ -412,6 +418,9 @@ struct qcom_battmgr {
+ 	u8 xiaomi_prop_data[32];
+ 	size_t xiaomi_prop_data_len;
+ 	u8 xiaomi_verify_slave;
++	bool battery_prop_probe_pending;
++	unsigned int battery_prop_probe;
++	u32 battery_prop_probe_value;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -460,6 +469,33 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
++static int qcom_battmgr_probe_battery_property(struct qcom_battmgr *battmgr,
++					       int property, u32 *out_value)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return -EOPNOTSUPP;
++
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	mutex_lock(&battmgr->lock);
++	battmgr->battery_prop_probe_pending = true;
++	battmgr->battery_prop_probe = property;
++	battmgr->battery_prop_probe_value = 0;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					    property, 0);
++	if (!ret)
++		*out_value = battmgr->battery_prop_probe_value;
++
++	battmgr->battery_prop_probe_pending = false;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
+ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, int opcode,
+ 						int property, u32 value, u32 *out_value)
+ {
+@@ -978,7 +1014,7 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -999,7 +1035,7 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -1387,6 +1423,34 @@ static ssize_t verify_digest_store(struct device *dev,
+ 
+ static DEVICE_ATTR_RW(verify_digest);
+ 
++struct qcom_battmgr_battery_probe_attr {
++	struct device_attribute dev_attr;
++	unsigned int prop;
++};
++
++static ssize_t qcom_battmgr_battery_probe_show(struct device *dev,
++					       struct device_attribute *attr,
++					       char *buf)
++{
++	struct qcom_battmgr_battery_probe_attr *probe_attr =
++		container_of(attr, struct qcom_battmgr_battery_probe_attr, dev_attr);
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, probe_attr->prop, &val);
++	if (ret < 0)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++#define QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(_name, _prop)		\
++	static struct qcom_battmgr_battery_probe_attr qcom_battmgr_battery_probe_attr_##_name = { \
++		.dev_attr = __ATTR(_name, 0444, qcom_battmgr_battery_probe_show, NULL), \
++		.prop = _prop,					\
++	}
++
+ #define QCOM_BATTMGR_XIAOMI_ATTR_RO(_name, _prop, _format)		\
+ 	static struct qcom_battmgr_xiaomi_attr qcom_battmgr_xiaomi_attr_##_name = { \
+ 		.dev_attr = __ATTR(_name, 0444, qcom_battmgr_xiaomi_prop_show, NULL), \
+@@ -1446,6 +1510,22 @@ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_hall4, XM_BATT_PEN_HALL4, QCOM_BATTMGR_XIAOMI_DE
+ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_tx_ss, XM_BATT_PEN_TX_SS, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RO(pen_place_err, XM_BATT_PEN_PLACE_ERR, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(fake_ss, XM_BATT_PEN_FAKE_SS, QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_night_charging, XM_BATT_NIGHT_CHARGING,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_smart_batt, XM_BATT_SMART_BATT,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_smart_chg, XM_BATT_SMART_CHG,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_charging_suspend_battery,
++			    XM_BATT_CHARGING_SUSPEND_BATTERY,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_enable_charging, XM_BATT_ENABLE_CHARGING,
++			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(probe_charge_control_limit, BATT_CHG_CTRL_LIM);
++QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(probe_charge_control_limit_max,
++				   BATT_CHG_CTRL_LIM_MAX);
++QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(probe_constant_charge_current,
++				   BATT_XIAOMI_CONSTANT_CURRENT);
+ QCOM_BATTMGR_XIAOMI_ATTR_WO(fg_fastcharge, XM_BATT_FG_FAST_CHARGE, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(slave_authentic, XM_BATT_SLAVE_AUTHENTIC, QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RW(pps_ptf, XM_BATT_PPS_PTF, QCOM_BATTMGR_XIAOMI_DEC);
+@@ -1481,6 +1561,14 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&qcom_battmgr_xiaomi_attr_pen_tx_ss.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pen_place_err.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_fake_ss.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_night_charging.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_smart_batt.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_smart_chg.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_charging_suspend_battery.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_probe_enable_charging.dev_attr.attr,
++	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit.dev_attr.attr,
++	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit_max.dev_attr.attr,
++	&qcom_battmgr_battery_probe_attr_probe_constant_charge_current.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+@@ -2136,6 +2224,24 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			break;
+ 		}
+ 
++		if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
++		    battmgr->battery_prop_probe_pending &&
++		    property == battmgr->battery_prop_probe) {
++			if (payload_len != sizeof(resp->intval)) {
++				dev_warn(battmgr->dev,
++					 "invalid payload length for raw battery property %#x request: %zd\n",
++					 property, payload_len);
++				battmgr->error = -ENODATA;
++				goto out_complete;
++			}
++
++			battmgr->error = le32_to_cpu(resp->intval.result);
++			if (!battmgr->error)
++				battmgr->battery_prop_probe_value =
++					le32_to_cpu(resp->intval.value);
++			goto out_complete;
++		}
++
+ 		if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+ 			/* Xiaomi added BATT_CONSTANT_CURRENT after BATT_CHG_CTRL_LIM_MAX according
+ 			 * to their code, but it also seems that two properties got removed?
+-- 
+2.34.1
+
