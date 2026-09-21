@@ -1,0 +1,349 @@
+From ab4066d93a0acf83383ccf751fb96ad01f11f0da Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 23:40:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: implement sheng charge
+ thresholds
+
+Implement the standard Linux charge-control start and end threshold ABI
+for Xiaomi sheng using the verified input_suspend firmware property. Keep
+0/100 as the disabled state so UPower can enable, disable, and persist the
+platform-provided threshold tuple through its supported D-Bus API.
+
+Evaluate dual-fuel-gauge SOC on notifications and a 15-second fallback.
+Suspend at the configured end threshold and resume at the start threshold.
+Clear suspension on driver removal or shutdown. Expose only read-only
+status diagnostics; no private test write attributes are included.
+---
+ drivers/power/supply/qcom_battmgr.c | 210 ++++++++++++++++++++++++++++
+ 1 file changed, 210 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index e00bf48..16a52ba 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -23,6 +23,9 @@
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
++#define SHENG_CHARGE_START_DEFAULT	0
++#define SHENG_CHARGE_END_DEFAULT	100
++#define SHENG_CHARGE_POLL_MS		15000
+ 
+ enum qcom_battmgr_variant {
+ 	QCOM_BATTMGR_SC8280XP,
+@@ -144,6 +147,7 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_BQ2597X_BATTERY_PRESENT		0x21
+ #define XM_BATT_BQ2597X_SLAVE_BATTERY_PRESENT	0x22
+ #define XM_BATT_BQ2597X_BATTERY_VOLTAGE		0x23
++#define XM_BATT_INPUT_SUSPEND			0x2a
+ #define XM_BATT_FASTCHGMODE			0x2b
+ #define XM_BATT_NIGHT_CHARGING			0x2c
+ #define XM_BATT_QUICK_CHARGE_TYPE		0x31
+@@ -421,6 +425,12 @@ struct qcom_battmgr {
+ 	bool battery_prop_probe_pending;
+ 	unsigned int battery_prop_probe;
+ 	u32 battery_prop_probe_value;
++	struct delayed_work charge_limit_work;
++	/* Serialize charge-limit policy state and firmware commands. */
++	struct mutex charge_limit_lock;
++	bool charge_limit_suspended;
++	u32 charge_limit_last_soc;
++	int charge_limit_last_result;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -591,6 +601,94 @@ static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_xiaomi_get_input_suspend(struct qcom_battmgr *battmgr, u32 *value)
++{
++	return qcom_battmgr_xiaomi_request_property(battmgr,
++						      BATTMGR_XM_PROPERTY_GET,
++						      XM_BATT_INPUT_SUSPEND,
++						      0, value);
++}
++
++static int qcom_battmgr_xiaomi_set_input_suspend(struct qcom_battmgr *battmgr, u32 value)
++{
++	return qcom_battmgr_xiaomi_request_property(battmgr,
++						      BATTMGR_XM_PROPERTY_SET,
++						      XM_BATT_INPUT_SUSPEND,
++						      value, NULL);
++}
++
++static void qcom_battmgr_schedule_charge_limit(struct qcom_battmgr *battmgr,
++					       unsigned long delay)
++{
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550)
++		mod_delayed_work(system_dfl_wq, &battmgr->charge_limit_work, delay);
++}
++
++static void qcom_battmgr_charge_limit_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						       struct qcom_battmgr,
++						       charge_limit_work);
++	u32 desired;
++	u32 value;
++	u32 soc;
++	int ret;
++
++	mutex_lock(&battmgr->charge_limit_lock);
++	if (!battmgr->service_up) {
++		ret = -EAGAIN;
++		goto out_result;
++	}
++
++	ret = qcom_battmgr_xiaomi_update_capacity(battmgr);
++	if (ret)
++		goto out_result;
++	soc = battmgr->status.percent;
++	battmgr->charge_limit_last_soc = soc;
++
++	ret = qcom_battmgr_xiaomi_get_input_suspend(battmgr, &value);
++	if (ret)
++		goto out_result;
++
++	desired = value;
++	if (battmgr->info.charge_ctrl_start == 0 &&
++	    battmgr->info.charge_ctrl_end == 100)
++		desired = 0;
++	else if (soc >= battmgr->info.charge_ctrl_end)
++		desired = 1;
++	else if (soc <= battmgr->info.charge_ctrl_start)
++		desired = 0;
++
++	if (desired != value) {
++		ret = qcom_battmgr_xiaomi_set_input_suspend(battmgr, desired);
++		if (ret)
++			goto out_result;
++
++		ret = qcom_battmgr_xiaomi_get_input_suspend(battmgr, &value);
++		if (ret)
++			goto out_result;
++		if (value != desired) {
++			ret = -EIO;
++			goto out_result;
++		}
++
++		dev_info(battmgr->dev,
++			 "sheng charge limit: SOC=%u, input_suspend=%u (%u/%u)\n",
++			 soc, value, battmgr->info.charge_ctrl_start,
++			 battmgr->info.charge_ctrl_end);
++		power_supply_changed(battmgr->bat_psy);
++	}
++
++	battmgr->charge_limit_suspended = !!value;
++	ret = 0;
++
++out_result:
++	battmgr->charge_limit_last_result = ret;
++	mutex_unlock(&battmgr->charge_limit_lock);
++
++	qcom_battmgr_schedule_charge_limit(battmgr, msecs_to_jiffies(SHENG_CHARGE_POLL_MS));
++}
++
+ static int qcom_battmgr_xiaomi_request_vdm(struct qcom_battmgr *battmgr, int opcode,
+ 					   int property, const __le32 *data,
+ 					   __le32 *out_data)
+@@ -1081,6 +1179,41 @@ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_set_sheng_threshold(struct qcom_battmgr *battmgr,
++					    enum power_supply_property psp,
++					    int value)
++{
++	mutex_lock(&battmgr->charge_limit_lock);
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		if (value != 0)
++			value = clamp(value, CHARGE_CTRL_START_THR_MIN,
++				      CHARGE_CTRL_START_THR_MAX);
++		battmgr->info.charge_ctrl_start = value;
++		if (value >= battmgr->info.charge_ctrl_end)
++			battmgr->info.charge_ctrl_end =
++				min_t(u32, value + CHARGE_CTRL_DELTA_SOC,
++				      CHARGE_CTRL_END_THR_MAX);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		value = clamp(value, CHARGE_CTRL_END_THR_MIN,
++			      CHARGE_CTRL_END_THR_MAX);
++		battmgr->info.charge_ctrl_end = value;
++		if (value <= battmgr->info.charge_ctrl_start)
++			battmgr->info.charge_ctrl_start =
++				max_t(u32, value - CHARGE_CTRL_DELTA_SOC,
++				      CHARGE_CTRL_START_THR_MIN);
++		break;
++	default:
++		mutex_unlock(&battmgr->charge_limit_lock);
++		return -EINVAL;
++	}
++	mutex_unlock(&battmgr->charge_limit_lock);
++
++	qcom_battmgr_schedule_charge_limit(battmgr, 0);
++	return 0;
++}
++
+ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 const union power_supply_propval *pval)
+@@ -1089,6 +1222,8 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
+ 
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550)
++		return qcom_battmgr_set_sheng_threshold(battmgr, psp, pval->intval);
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+@@ -1423,6 +1558,30 @@ static ssize_t verify_digest_store(struct device *dev,
+ 
+ static DEVICE_ATTR_RW(verify_digest);
+ 
++static ssize_t charge_limit_status_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&battmgr->charge_limit_lock);
++	len = sysfs_emit(buf,
++			 "enabled=%u start=%u end=%u soc=%u suspended=%u result=%d\n",
++			 !(battmgr->info.charge_ctrl_start == 0 &&
++			   battmgr->info.charge_ctrl_end == 100),
++			 battmgr->info.charge_ctrl_start,
++			 battmgr->info.charge_ctrl_end,
++			 battmgr->charge_limit_last_soc,
++			 battmgr->charge_limit_suspended,
++			 battmgr->charge_limit_last_result);
++	mutex_unlock(&battmgr->charge_limit_lock);
++
++	return len;
++}
++
++static DEVICE_ATTR_RO(charge_limit_status);
++
+ struct qcom_battmgr_battery_probe_attr {
+ 	struct device_attribute dev_attr;
+ 	unsigned int prop;
+@@ -1521,6 +1680,8 @@ QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_charging_suspend_battery,
+ 			    QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_XIAOMI_ATTR_RO(probe_enable_charging, XM_BATT_ENABLE_CHARGING,
+ 			    QCOM_BATTMGR_XIAOMI_DEC);
++QCOM_BATTMGR_XIAOMI_ATTR_RO(charge_limit_input_suspend, XM_BATT_INPUT_SUSPEND,
++			    QCOM_BATTMGR_XIAOMI_DEC);
+ QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(probe_charge_control_limit, BATT_CHG_CTRL_LIM);
+ QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(probe_charge_control_limit_max,
+ 				   BATT_CHG_CTRL_LIM_MAX);
+@@ -1566,6 +1727,7 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&qcom_battmgr_xiaomi_attr_probe_smart_chg.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_probe_charging_suspend_battery.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_probe_enable_charging.dev_attr.attr,
++	&qcom_battmgr_xiaomi_attr_charge_limit_input_suspend.dev_attr.attr,
+ 	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit.dev_attr.attr,
+ 	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit_max.dev_attr.attr,
+ 	&qcom_battmgr_battery_probe_attr_probe_constant_charge_current.dev_attr.attr,
+@@ -1575,6 +1737,7 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&dev_attr_request_vdm_cmd.attr,
+ 	&dev_attr_verify_slave_flag.attr,
+ 	&dev_attr_verify_digest.attr,
++	&dev_attr_charge_limit_status.attr,
+ 	NULL
+ };
+ 
+@@ -2013,6 +2176,8 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 			dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
+ 		break;
+ 	}
++
++	qcom_battmgr_schedule_charge_limit(battmgr, 0);
+ }
+ 
+ static void qcom_battmgr_sc8280xp_strcpy(char *dest, const char *src)
+@@ -2479,6 +2644,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+ 		battmgr->service_up = true;
+ 		schedule_work(&battmgr->enable_work);
++		qcom_battmgr_schedule_charge_limit(battmgr, 0);
+ 	} else {
+ 		battmgr->service_up = false;
+ 	}
+@@ -2525,7 +2691,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
+ 	mutex_init(&battmgr->lock);
++	mutex_init(&battmgr->charge_limit_lock);
+ 	init_completion(&battmgr->ack);
++	battmgr->charge_limit_last_result = -ENODATA;
+ 
+ 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
+ 	if (match)
+@@ -2539,6 +2707,14 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 				     "failed to init battery charge control thresholds\n");
+ 
+ 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		battmgr->info.charge_ctrl_start = SHENG_CHARGE_START_DEFAULT;
++		battmgr->info.charge_ctrl_end = SHENG_CHARGE_END_DEFAULT;
++
++		ret = devm_delayed_work_autocancel(dev, &battmgr->charge_limit_work,
++						   qcom_battmgr_charge_limit_worker);
++		if (ret)
++			return ret;
++
+ 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+ 		if (ret < 0)
+ 			return dev_err_probe(dev, ret, "failed to add Xiaomi battery attributes\n");
+@@ -2619,6 +2795,38 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_finish_charge_limit(struct qcom_battmgr *battmgr)
++{
++	u32 value = U32_MAX;
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return;
++
++	cancel_delayed_work_sync(&battmgr->charge_limit_work);
++	mutex_lock(&battmgr->charge_limit_lock);
++	if (battmgr->service_up) {
++		ret = qcom_battmgr_xiaomi_set_input_suspend(battmgr, 0);
++		if (!ret)
++			ret = qcom_battmgr_xiaomi_get_input_suspend(battmgr, &value);
++		if (ret || value != 0)
++			dev_crit(battmgr->dev,
++				 "failed to clear sheng charge limit while stopping: %d value=%u\n",
++				 ret, value);
++	}
++	mutex_unlock(&battmgr->charge_limit_lock);
++}
++
++static void qcom_battmgr_remove(struct auxiliary_device *adev)
++{
++	qcom_battmgr_finish_charge_limit(dev_get_drvdata(&adev->dev));
++}
++
++static void qcom_battmgr_shutdown(struct auxiliary_device *adev)
++{
++	qcom_battmgr_finish_charge_limit(dev_get_drvdata(&adev->dev));
++}
++
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+ 	{ .name = "pmic_glink.power-supply", },
+ 	{},
+@@ -2628,6 +2836,8 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
++	.remove = qcom_battmgr_remove,
++	.shutdown = qcom_battmgr_shutdown,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 
+-- 
+2.34.1
+
