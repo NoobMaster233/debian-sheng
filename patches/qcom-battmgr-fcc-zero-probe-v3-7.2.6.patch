@@ -1,0 +1,424 @@
+From 64b92fada66a16a394dc7e2d311900d2ef622893 Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Mon, 21 Sep 2026 10:40:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: add bounded FCC zero probe
+
+Add a root-only, fixed-duration diagnostic for Xiaomi battery property
+12 after read-only hardware probing identified it as the constant-current
+field. Save and validate the live FCC, schedule restoration before setting
+zero, and restore after ten seconds.
+
+Record SET results and GET readback, provide an immediate restore
+trigger, retry restoration, and attempt restoration on charger service
+return, driver removal and shutdown. Driver load performs no test write.
+This remains a boot-only diagnostic, not the production 80 percent policy.
+---
+ drivers/power/supply/qcom_battmgr.c | 314 +++++++++++++++++++++++++++-
+ 1 file changed, 308 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index e00bf48..18e6c7a 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -23,6 +23,11 @@
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
++#define BATTMGR_FCC_TEST_DURATION_MS	10000
++#define BATTMGR_FCC_RESTORE_RETRY_MS	1000
++#define BATTMGR_FCC_RESTORE_MAX_ATTEMPTS	30
++#define BATTMGR_FCC_TEST_MIN_UA		100000
++#define BATTMGR_FCC_TEST_MAX_UA		10000000
+ 
+ enum qcom_battmgr_variant {
+ 	QCOM_BATTMGR_SC8280XP,
+@@ -421,6 +426,20 @@ struct qcom_battmgr {
+ 	bool battery_prop_probe_pending;
+ 	unsigned int battery_prop_probe;
+ 	u32 battery_prop_probe_value;
++	struct delayed_work fcc_restore_work;
++	/* Serialize test state and restoration against sysfs operations. */
++	struct mutex fcc_test_lock;
++	bool fcc_test_active;
++	u32 fcc_test_saved_ua;
++	u32 fcc_test_after_set_ua;
++	u32 fcc_test_before_restore_ua;
++	u32 fcc_test_after_restore_ua;
++	int fcc_test_set_result;
++	int fcc_test_set_read_result;
++	int fcc_test_restore_set_result;
++	int fcc_test_restore_read_result;
++	int fcc_test_restore_result;
++	unsigned int fcc_test_restore_attempts;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -496,6 +515,103 @@ static int qcom_battmgr_probe_battery_property(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++static int qcom_battmgr_set_probe_battery_property(struct qcom_battmgr *battmgr,
++						   int property, u32 value)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return -EOPNOTSUPP;
++
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	mutex_lock(&battmgr->lock);
++	battmgr->battery_prop_probe_pending = true;
++	battmgr->battery_prop_probe = property;
++	battmgr->battery_prop_probe_value = 0;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
++					    property, value);
++
++	battmgr->battery_prop_probe_pending = false;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_restore_fcc_locked(struct qcom_battmgr *battmgr)
++{
++	int property = BATT_XIAOMI_CONSTANT_CURRENT;
++	u32 saved_ua = battmgr->fcc_test_saved_ua;
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, property, &value);
++	if (!ret)
++		battmgr->fcc_test_before_restore_ua = value;
++
++	ret = qcom_battmgr_set_probe_battery_property(battmgr, property, saved_ua);
++	battmgr->fcc_test_restore_set_result = ret;
++
++	read_ret = qcom_battmgr_probe_battery_property(battmgr, property, &value);
++	battmgr->fcc_test_restore_read_result = read_ret;
++	if (!read_ret)
++		battmgr->fcc_test_after_restore_ua = value;
++
++	if (!read_ret && value >= BATTMGR_FCC_TEST_MIN_UA &&
++	    value <= BATTMGR_FCC_TEST_MAX_UA) {
++		battmgr->fcc_test_active = false;
++		ret = 0;
++		goto out_result;
++	}
++
++	if (!ret)
++		ret = read_ret ? read_ret : -EIO;
++
++out_result:
++	battmgr->fcc_test_restore_result = ret;
++	return ret;
++}
++
++static void qcom_battmgr_fcc_restore_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						       struct qcom_battmgr,
++						       fcc_restore_work);
++	int ret;
++
++	mutex_lock(&battmgr->fcc_test_lock);
++	if (!battmgr->fcc_test_active)
++		goto out_unlock;
++
++	battmgr->fcc_test_restore_attempts++;
++	ret = qcom_battmgr_restore_fcc_locked(battmgr);
++	if (!ret) {
++		dev_info(battmgr->dev, "FCC probe restored %u uA (requested %u uA)\n",
++			 battmgr->fcc_test_after_restore_ua,
++			 battmgr->fcc_test_saved_ua);
++		goto out_unlock;
++	}
++
++	if (battmgr->fcc_test_restore_attempts <
++	    BATTMGR_FCC_RESTORE_MAX_ATTEMPTS) {
++		dev_warn(battmgr->dev,
++			 "FCC probe restore attempt %u failed: %d; retrying\n",
++			 battmgr->fcc_test_restore_attempts, ret);
++		mod_delayed_work(system_wq, &battmgr->fcc_restore_work,
++				 msecs_to_jiffies(BATTMGR_FCC_RESTORE_RETRY_MS));
++	} else {
++		dev_crit(battmgr->dev,
++			 "FCC probe restore failed after %u attempts: %d\n",
++			 battmgr->fcc_test_restore_attempts, ret);
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->fcc_test_lock);
++}
++
+ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, int opcode,
+ 						int property, u32 value, u32 *out_value)
+ {
+@@ -1445,6 +1561,141 @@ static ssize_t qcom_battmgr_battery_probe_show(struct device *dev,
+ 	return sysfs_emit(buf, "%u\n", val);
+ }
+ 
++static ssize_t probe_fcc_test_status_show(struct device *dev,
++					  struct device_attribute *attr,
++					  char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&battmgr->fcc_test_lock);
++	len = sysfs_emit(buf, "active=%u saved_ua=%u set_result=%d\n",
++			 battmgr->fcc_test_active, battmgr->fcc_test_saved_ua,
++			 battmgr->fcc_test_set_result);
++	len += sysfs_emit_at(buf, len, "set_read_result=%d after_set_ua=%u\n",
++			 battmgr->fcc_test_set_read_result,
++			 battmgr->fcc_test_after_set_ua);
++	len += sysfs_emit_at(buf, len, "before_restore_ua=%u restore_result=%d\n",
++			 battmgr->fcc_test_before_restore_ua,
++			 battmgr->fcc_test_restore_result);
++	len += sysfs_emit_at(buf, len, "restore_set_result=%d restore_read_result=%d\n",
++			 battmgr->fcc_test_restore_set_result,
++			 battmgr->fcc_test_restore_read_result);
++	len += sysfs_emit_at(buf, len, "after_restore_ua=%u attempts=%u\n",
++			 battmgr->fcc_test_after_restore_ua,
++			 battmgr->fcc_test_restore_attempts);
++	mutex_unlock(&battmgr->fcc_test_lock);
++
++	return len;
++}
++
++static ssize_t probe_fcc_zero_test_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	int property = BATT_XIAOMI_CONSTANT_CURRENT;
++	u32 trigger;
++	u32 value;
++	int read_ret;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->fcc_test_lock);
++	if (battmgr->fcc_test_active) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_probe_battery_property(battmgr, property, &value);
++	if (ret)
++		goto out_unlock;
++
++	if (value < BATTMGR_FCC_TEST_MIN_UA ||
++	    value > BATTMGR_FCC_TEST_MAX_UA) {
++		ret = -ERANGE;
++		goto out_unlock;
++	}
++
++	battmgr->fcc_test_saved_ua = value;
++	battmgr->fcc_test_after_set_ua = U32_MAX;
++	battmgr->fcc_test_before_restore_ua = U32_MAX;
++	battmgr->fcc_test_after_restore_ua = U32_MAX;
++	battmgr->fcc_test_set_result = -EINPROGRESS;
++	battmgr->fcc_test_set_read_result = -EINPROGRESS;
++	battmgr->fcc_test_restore_set_result = -EINPROGRESS;
++	battmgr->fcc_test_restore_read_result = -EINPROGRESS;
++	battmgr->fcc_test_restore_result = -EINPROGRESS;
++	battmgr->fcc_test_restore_attempts = 0;
++	battmgr->fcc_test_active = true;
++
++	mod_delayed_work(system_wq, &battmgr->fcc_restore_work,
++			 msecs_to_jiffies(BATTMGR_FCC_TEST_DURATION_MS));
++
++	ret = qcom_battmgr_set_probe_battery_property(battmgr, property, 0);
++	battmgr->fcc_test_set_result = ret;
++	read_ret = qcom_battmgr_probe_battery_property(battmgr, property, &value);
++	battmgr->fcc_test_set_read_result = read_ret;
++	if (!read_ret)
++		battmgr->fcc_test_after_set_ua = value;
++
++	if (ret || read_ret || value != 0) {
++		mod_delayed_work(system_wq, &battmgr->fcc_restore_work, 0);
++		if (!ret)
++			ret = read_ret ? read_ret : -EIO;
++		goto out_unlock;
++	}
++
++	dev_info(battmgr->dev,
++		 "FCC zero probe armed for %u ms; saved=%u uA readback=%u result=%d\n",
++		 BATTMGR_FCC_TEST_DURATION_MS, battmgr->fcc_test_saved_ua,
++		 battmgr->fcc_test_after_set_ua,
++		 battmgr->fcc_test_set_read_result);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->fcc_test_lock);
++	return ret ? ret : count;
++}
++
++static ssize_t probe_fcc_restore_now_store(struct device *dev,
++					   struct device_attribute *attr,
++					   const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 trigger;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &trigger);
++	if (ret)
++		return ret;
++	if (trigger != 1)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->fcc_test_lock);
++	if (!battmgr->fcc_test_active) {
++		ret = -EALREADY;
++		goto out_unlock;
++	}
++
++	battmgr->fcc_test_restore_attempts = 0;
++	mod_delayed_work(system_wq, &battmgr->fcc_restore_work, 0);
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&battmgr->fcc_test_lock);
++	return ret ? ret : count;
++}
++
++static DEVICE_ATTR_RO(probe_fcc_test_status);
++static DEVICE_ATTR_WO(probe_fcc_zero_test);
++static DEVICE_ATTR_WO(probe_fcc_restore_now);
++
+ #define QCOM_BATTMGR_BATTERY_PROBE_ATTR_RO(_name, _prop)		\
+ 	static struct qcom_battmgr_battery_probe_attr qcom_battmgr_battery_probe_attr_##_name = { \
+ 		.dev_attr = __ATTR(_name, 0444, qcom_battmgr_battery_probe_show, NULL), \
+@@ -1569,6 +1820,9 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit.dev_attr.attr,
+ 	&qcom_battmgr_battery_probe_attr_probe_charge_control_limit_max.dev_attr.attr,
+ 	&qcom_battmgr_battery_probe_attr_probe_constant_charge_current.dev_attr.attr,
++	&dev_attr_probe_fcc_test_status.attr,
++	&dev_attr_probe_fcc_zero_test.attr,
++	&dev_attr_probe_fcc_restore_now.attr,
+ 	&qcom_battmgr_xiaomi_attr_fg_fastcharge.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_slave_authentic.dev_attr.attr,
+ 	&qcom_battmgr_xiaomi_attr_pps_ptf.dev_attr.attr,
+@@ -2218,12 +2472,6 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 	case BATTMGR_BAT_PROPERTY_SET:
+ 	case BATTMGR_BAT_PROPERTY_GET:
+ 		property = le32_to_cpu(resp->intval.property);
+-		if (opcode == BATTMGR_BAT_PROPERTY_SET) {
+-			if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
+-				dev_warn(battmgr->dev, "unexpected battery property set response\n");
+-			break;
+-		}
+-
+ 		if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+ 		    battmgr->battery_prop_probe_pending &&
+ 		    property == battmgr->battery_prop_probe) {
+@@ -2242,6 +2490,12 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			goto out_complete;
+ 		}
+ 
++		if (opcode == BATTMGR_BAT_PROPERTY_SET) {
++			if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++				dev_warn(battmgr->dev, "unexpected battery property set response\n");
++			break;
++		}
++
+ 		if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+ 			/* Xiaomi added BATT_CONSTANT_CURRENT after BATT_CHG_CTRL_LIM_MAX according
+ 			 * to their code, but it also seems that two properties got removed?
+@@ -2479,6 +2733,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+ 		battmgr->service_up = true;
+ 		schedule_work(&battmgr->enable_work);
++		if (READ_ONCE(battmgr->fcc_test_active))
++			mod_delayed_work(system_wq, &battmgr->fcc_restore_work, 0);
+ 	} else {
+ 		battmgr->service_up = false;
+ 	}
+@@ -2525,7 +2781,16 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
+ 	mutex_init(&battmgr->lock);
++	mutex_init(&battmgr->fcc_test_lock);
+ 	init_completion(&battmgr->ack);
++	battmgr->fcc_test_after_set_ua = U32_MAX;
++	battmgr->fcc_test_before_restore_ua = U32_MAX;
++	battmgr->fcc_test_after_restore_ua = U32_MAX;
++	battmgr->fcc_test_set_result = -ENODATA;
++	battmgr->fcc_test_set_read_result = -ENODATA;
++	battmgr->fcc_test_restore_set_result = -ENODATA;
++	battmgr->fcc_test_restore_read_result = -ENODATA;
++	battmgr->fcc_test_restore_result = -ENODATA;
+ 
+ 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
+ 	if (match)
+@@ -2539,6 +2804,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 				     "failed to init battery charge control thresholds\n");
+ 
+ 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		ret = devm_delayed_work_autocancel(dev, &battmgr->fcc_restore_work,
++						   qcom_battmgr_fcc_restore_worker);
++		if (ret)
++			return ret;
++
+ 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+ 		if (ret < 0)
+ 			return dev_err_probe(dev, ret, "failed to add Xiaomi battery attributes\n");
+@@ -2619,6 +2889,36 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_finish_fcc_probe(struct qcom_battmgr *battmgr)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return;
++
++	cancel_delayed_work_sync(&battmgr->fcc_restore_work);
++
++	mutex_lock(&battmgr->fcc_test_lock);
++	if (battmgr->fcc_test_active) {
++		ret = qcom_battmgr_restore_fcc_locked(battmgr);
++		if (ret)
++			dev_crit(battmgr->dev,
++				 "failed to restore FCC while stopping driver: %d\n",
++				 ret);
++	}
++	mutex_unlock(&battmgr->fcc_test_lock);
++}
++
++static void qcom_battmgr_remove(struct auxiliary_device *adev)
++{
++	qcom_battmgr_finish_fcc_probe(dev_get_drvdata(&adev->dev));
++}
++
++static void qcom_battmgr_shutdown(struct auxiliary_device *adev)
++{
++	qcom_battmgr_finish_fcc_probe(dev_get_drvdata(&adev->dev));
++}
++
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+ 	{ .name = "pmic_glink.power-supply", },
+ 	{},
+@@ -2628,6 +2928,8 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
++	.remove = qcom_battmgr_remove,
++	.shutdown = qcom_battmgr_shutdown,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 
+-- 
+2.34.1
+
