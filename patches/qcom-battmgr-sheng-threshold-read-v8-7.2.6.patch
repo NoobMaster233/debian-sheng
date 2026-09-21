@@ -1,0 +1,35 @@
+From e6b82a8b1e30a7a6f7f90a3181551c9c9099f6e5 Mon Sep 17 00:00:00 2001
+From: sheng maintenance research <noreply@local>
+Date: Tue, 22 Sep 2026 00:05:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: preserve sheng threshold reads
+
+Skip unsupported charger-firmware GET requests when userspace reads the
+standard charge-control thresholds on sheng. Return local values written
+through the standard power_supply ABI. This prevents the firmware default
+zero from overwriting the UPower 75/80 tuple.
+---
+ drivers/power/supply/qcom_battmgr.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 16a52ba..ffbe179 100755
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -926,8 +926,12 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+-	    battmgr->variant == QCOM_BATTMGR_X1E80100)
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
++	    (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++	     psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD))
++		ret = 0;
++	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++		 battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+ 	else
+ 		ret = qcom_battmgr_bat_sm8350_update(battmgr, psp);
+-- 
+2.34.1
+
