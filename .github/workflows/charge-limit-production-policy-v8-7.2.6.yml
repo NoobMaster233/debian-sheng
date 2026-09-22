@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 production charge-limit policy v8
+name: Build sheng 7.2.6 production charge-limit policy v9
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 production charge-limit policy v8
+    name: Build pinned 7.2.6 production charge-limit policy v9
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -20,6 +20,7 @@ jobs:
       PROBE_PATCH_V2: patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch
       POLICY_PATCH: patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch
       READ_FIX_PATCH: patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch
+      UART_SLEEP_PATCH: patches/qcom-geni-force-system-sleep-v9-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -54,8 +55,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: charge-policy-v8-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch') }}
+          key: charge-policy-v9-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-force-system-sleep-v9-7.2.6.patch') }}
           restore-keys: |
+            charge-policy-v9-7.2.6-clang21-
             charge-policy-v8-7.2.6-clang21-
             charge-policy-v7-7.2.6-clang21-
             charge-readonly-v2-7.2.6-clang21-
@@ -77,6 +79,8 @@ jobs:
           git -C linux apply "${GITHUB_WORKSPACE}/${POLICY_PATCH}"
           git -C linux apply --check "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}"
           git -C linux apply "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}"
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${UART_SLEEP_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${UART_SLEEP_PATCH}"
           git -C linux diff --check
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}" | tee checkpatch-v2.txt
@@ -84,11 +88,14 @@ jobs:
             "${GITHUB_WORKSPACE}/${POLICY_PATCH}" | tee checkpatch-v7.txt
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}" | tee checkpatch-v8.txt
+          linux/scripts/checkpatch.pl --strict --no-tree \
+            "${GITHUB_WORKSPACE}/${UART_SLEEP_PATCH}" | tee checkpatch-v9-uart.txt
           grep -q '0 errors, 0 warnings' checkpatch-v2.txt
           grep -q '0 errors, 0 warnings' checkpatch-v7.txt
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
+          grep -q '0 errors, 0 warnings' checkpatch-v9-uart.txt
 
-      - name: Configure boot-only probe
+      - name: Configure production kernel
         run: |
           cp sm8550.config linux/.config
           linux/scripts/config --file linux/.config --enable BATTERY_QCOM_BATTMGR
@@ -112,9 +119,12 @@ jobs:
           test -s linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb
           test -s linux/System.map
           test -s linux/drivers/power/supply/qcom_battmgr.o
+          test -s linux/drivers/tty/serial/qcom_geni_serial.o
           test ! -e linux/drivers/power/supply/qcom_battmgr.ko
           grep -q ' qcom_battmgr_xiaomi_prop_show$' linux/System.map
           grep -q ' qcom_battmgr_driver$' linux/System.map
+          grep -q ' qcom_geni_serial_suspend$' linux/System.map
+          grep -q ' qcom_geni_serial_resume$' linux/System.map
           llvm-nm -a linux/drivers/power/supply/qcom_battmgr.o | \
             grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging|charge_control_limit|charge_control_limit_max|constant_charge_current)|charge_limit|input_suspend' \
             > qcom-battmgr-probe-symbols.txt
@@ -142,7 +152,7 @@ jobs:
         run: |
           mkdir -p out
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
-            checkpatch-v8.txt \
+            checkpatch-v8.txt checkpatch-v9-uart.txt \
             qcom-battmgr-probe-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
@@ -151,6 +161,7 @@ jobs:
           cp "$PROBE_PATCH_V2" out/
           cp "$POLICY_PATCH" out/
           cp "$READ_FIX_PATCH" out/
+          cp "$UART_SLEEP_PATCH" out/
           git -C linux diff > out/kernel.patch
           {
             echo "workflow_repository=${GITHUB_REPOSITORY}"
@@ -162,7 +173,7 @@ jobs:
             echo "boot_cmdline=${BOOT_CMDLINE}"
             echo "BATTERY_QCOM_BATTMGR=built-in"
             echo "external_qcom_battmgr=blacklisted by boot cmdline"
-            echo "policy_version=v8"
+            echo "policy_version=v9"
             echo "policy_backend=xiaomi input_suspend 0x2a"
             echo "standard_abi=charge_control_start_threshold,charge_control_end_threshold"
             echo "disabled_tuple=0,100"
@@ -171,6 +182,8 @@ jobs:
             echo "policy_cleanup=clear input_suspend on remove/shutdown"
             echo "threshold_reads=local policy state; no unsupported firmware GET"
             echo "private_write_test_attributes=none"
+            echo "uart_sleep_backport=d0cd9c8d0fd59bc7d140f3d60cf02e1d80376dab"
+            echo "uart_sleep_fix=pm_runtime_force_suspend/resume in qcom-geni system sleep callbacks"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -184,15 +197,17 @@ jobs:
             qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch \
             qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch \
             qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch \
+            qcom-geni-force-system-sleep-v9-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt \
+            checkpatch-v9-uart.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
-      - name: Upload probe artifact
+      - name: Upload production artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-charge-limit-policy-v8
+          name: sheng-7.2.6-charge-limit-policy-v9-uart-resume
           path: out/
           retention-days: 14
           if-no-files-found: error
