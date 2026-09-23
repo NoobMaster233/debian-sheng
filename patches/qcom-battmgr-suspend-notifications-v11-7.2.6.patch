@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 00:35:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: pause Xiaomi notifications in
+ suspend
+
+Xiaomi's downstream battery charger driver sends
+BC_DISABLE_NOTIFY_REQ when the display is blanked and re-enables
+notifications when it is unblanked. The mainline qcom_battmgr driver
+requests notifications when chargerpd comes up but never disables them.
+
+On Xiaomi sheng, chargerpd sends 220-byte XM_PROP_CHG_DEBUG messages of
+type CHG_ADSP_LOG while the AP is suspended. These messages arrive over
+the wake-capable PMIC GLINK channel and wake the AP even though Linux has
+no pending battery request.
+
+Follow the downstream protocol at the narrower system-sleep boundary for
+the Xiaomi SM8550 variant. Cancel a pending enable worker, request opcode
+0x05 before suspend, and schedule the existing enable worker after
+resume. A failed disable request is warned about but does not block
+system sleep. Other qcom_battmgr variants retain their existing behavior.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 51 +++++++++++++++++++++++++++----
+ 1 file changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 000000000000..111111111111 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -35,6 +35,7 @@ enum qcom_battmgr_variant {
+ #define BATTMGR_BAT_STATUS		0x1
+ 
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
++#define BATTMGR_DISABLE_NOTIFICATION	0x5
+ 
+ #define BATTMGR_NOTIFICATION		0x7
+ #define NOTIF_BAT_PROPERTY		0x30
+@@ -2351,21 +2352,61 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+ }
+ 
+-static void qcom_battmgr_enable_worker(struct work_struct *work)
++static int qcom_battmgr_set_notifications(struct qcom_battmgr *battmgr,
++					  bool enable)
+ {
+-	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
+ 	struct qcom_battmgr_enable_request req = {
+ 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+ 		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
+-		.hdr.opcode = cpu_to_le32(BATTMGR_REQUEST_NOTIFICATION),
++		.hdr.opcode = cpu_to_le32(enable ? BATTMGR_REQUEST_NOTIFICATION :
++						 BATTMGR_DISABLE_NOTIFICATION),
+ 	};
++
++	return qcom_battmgr_request(battmgr, &req, sizeof(req));
++}
++
++static void qcom_battmgr_enable_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
++						     enable_work);
+ 	int ret;
+ 
+-	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	ret = qcom_battmgr_set_notifications(battmgr, true);
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+ }
+ 
++static int qcom_battmgr_suspend(struct auxiliary_device *adev,
++				pm_message_t state)
++{
++	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550 ||
++	    !battmgr->service_up)
++		return 0;
++
++	cancel_work_sync(&battmgr->enable_work);
++	ret = qcom_battmgr_set_notifications(battmgr, false);
++	if (ret)
++		dev_warn(battmgr->dev,
++			 "failed to disable power notifications for suspend: %d\n",
++			 ret);
++
++	return 0;
++}
++
++static int qcom_battmgr_resume(struct auxiliary_device *adev)
++{
++	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
++
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
++	    battmgr->service_up)
++		schedule_work(&battmgr->enable_work);
++
++	return 0;
++}
++
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+@@ -2840,8 +2882,10 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
+ 	.remove = qcom_battmgr_remove,
+ 	.shutdown = qcom_battmgr_shutdown,
++	.suspend = qcom_battmgr_suspend,
++	.resume = qcom_battmgr_resume,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 
+-- 
+2.51.0
