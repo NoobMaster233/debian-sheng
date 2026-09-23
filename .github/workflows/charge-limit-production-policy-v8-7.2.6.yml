@@ -148,7 +148,10 @@ jobs:
           grep -q ' qcom_geni_serial_suspend$' linux/System.map
           grep -q ' qcom_geni_serial_resume$' linux/System.map
           grep -q ' qcom_battmgr_pm_ops$' linux/System.map
-          grep -q ' qcom_battmgr_set_log_properties$' linux/System.map
+          strings linux/vmlinux | \
+            grep -qF 'failed to pause chargerpd logging for suspend'
+          strings linux/vmlinux | \
+            grep -qF 'failed to restore chargerpd logging after resume'
           llvm-nm -a linux/drivers/power/supply/qcom_battmgr.o | \
             grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging|charge_control_limit|charge_control_limit_max|constant_charge_current)|charge_limit|input_suspend' \
             > qcom-battmgr-probe-symbols.txt
