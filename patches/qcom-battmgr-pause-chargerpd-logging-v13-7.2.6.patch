@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 03:00:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: pause sheng chargerpd logs in
+ suspend
+
+The sheng boot firmware configures chargerpd log level 4 and category mask
+0xe00008000 over PMIC GLINK.  Runtime tracing shows that the resulting
+CHG_ADSP_LOG messages wake APSS from system suspend.
+
+Qualcomm's downstream battery debug driver documents opcode 0x19 as a
+request containing a 64-bit category mask and 32-bit log level.  Use that
+protocol on the Xiaomi SM8550 variant to set both fields to zero before
+system suspend.  Restore the exact sheng firmware values on resume so that
+normal awake diagnostics are preserved.
+
+Handle the header-only acknowledgement before the generic SM8350 payload
+length check.  A failed request is warned about but does not block system
+suspend or resume.  Other variants are unchanged.
+
+Link: https://github.com/Project-Aloha/mu_aloha_platforms/blob/8d37e2bfab2f9d959ac0b3d68434e8be4866bf55/Platforms/KailuaPkg/Device/xiaomi-sheng/Binaries/RawFiles/QcomChargerCfg.cfg
+Link: https://github.com/Xelef2000/ubuntu-touch-kernel-duo2/blob/e3e17ac06abc83a3aadc5b53424905b3d39b995e/drivers/soc/qcom/qti_battery_debug.c
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 53 ++++++++++++++++++++++++++---
+ 1 file changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 2ce8b5a..c6461d4 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -39,6 +39,10 @@ enum qcom_battmgr_variant {
+ 
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
+ #define BATTMGR_DISABLE_NOTIFICATION	0x5
++#define BATTMGR_SET_LOGGING_PROPERTIES	0x19
++
++#define SHENG_CHARGERPD_LOG_CATEGORIES	0xe00008000ULL
++#define SHENG_CHARGERPD_LOG_LEVEL	4
+ 
+ #define BATTMGR_NOTIFICATION		0x7
+ #define NOTIF_BAT_PROPERTY		0x30
+@@ -184,6 +188,12 @@ struct qcom_battmgr_enable_request {
+ 	__le32 high_capacity;
+ };
+ 
++struct qcom_battmgr_log_properties_request {
++	struct pmic_glink_hdr hdr;
++	__le64 categories;
++	__le32 level;
++};
++
+ struct qcom_battmgr_property_request {
+ 	struct pmic_glink_hdr hdr;
+ 	__le32 battery;
+@@ -2618,7 +2628,11 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 	struct qcom_battmgr *battmgr = priv;
+ 	unsigned int opcode = le32_to_cpu(hdr->opcode);
+ 
+-	if (opcode == BATTMGR_NOTIFICATION)
++	if (opcode == BATTMGR_SET_LOGGING_PROPERTIES &&
++	    battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		battmgr->error = 0;
++		complete(&battmgr->ack);
++	} else if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+ 	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 		 battmgr->variant == QCOM_BATTMGR_X1E80100)
+@@ -2640,6 +2654,20 @@ static int qcom_battmgr_set_notifications(struct qcom_battmgr *battmgr,
+ 	return qcom_battmgr_request(battmgr, &req, sizeof(req));
+ }
+ 
++static int qcom_battmgr_set_log_properties(struct qcom_battmgr *battmgr,
++					   u64 categories, u32 level)
++{
++	struct qcom_battmgr_log_properties_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(BATTMGR_SET_LOGGING_PROPERTIES),
++		.categories = cpu_to_le64(categories),
++		.level = cpu_to_le32(level),
++	};
++
++	return qcom_battmgr_request(battmgr, &req, sizeof(req));
++}
++
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+@@ -2661,6 +2689,12 @@ static int qcom_battmgr_suspend(struct device *dev)
+ 		return 0;
+ 
+ 	cancel_work_sync(&battmgr->enable_work);
++	ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
++	if (ret)
++		dev_warn(battmgr->dev,
++			 "failed to pause chargerpd logging for suspend: %d\n",
++			 ret);
++
+ 	ret = qcom_battmgr_set_notifications(battmgr, false);
+ 	if (ret)
+ 		dev_warn(battmgr->dev,
+@@ -2673,10 +2707,21 @@ static int qcom_battmgr_suspend(struct device *dev)
+ static int qcom_battmgr_resume(struct device *dev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	int ret;
+ 
+-	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+-	    battmgr->service_up)
+-		schedule_work(&battmgr->enable_work);
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550 ||
++	    !battmgr->service_up)
++		return 0;
++
++	ret = qcom_battmgr_set_log_properties(battmgr,
++					       SHENG_CHARGERPD_LOG_CATEGORIES,
++					       SHENG_CHARGERPD_LOG_LEVEL);
++	if (ret)
++		dev_warn(battmgr->dev,
++			 "failed to restore chargerpd logging after resume: %d\n",
++			 ret);
++
++	schedule_work(&battmgr->enable_work);
+ 
+ 	return 0;
+ }
+-- 
+2.51.0
