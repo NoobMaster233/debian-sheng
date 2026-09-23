@@ -70,7 +70,6 @@ jobs:
             charge-policy-v8-7.2.6-clang21-
             charge-policy-v7-7.2.6-clang21-
             charge-readonly-v2-7.2.6-clang21-
-            charge-readonly-7.2.6-clang21-
 
       - name: Fetch exact kernel baseline
         run: |
