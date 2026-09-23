@@ -10,9 +10,9 @@ the immediately following standard battery notification request received a
 16-byte response normally.
 
 The logical protocol is a 12-byte header followed by a 64-bit category mask
-and a 32-bit level.  Avoid host ABI padding by representing the little-endian
-64-bit mask as explicit low and high 32-bit words, giving an exact 24-byte
-wire request.
+and a 32-bit level.  Avoid host ABI padding by representing the
+little-endian 64-bit mask as explicit low and high 32-bit words, giving an
+exact 24-byte wire request.
 
 Qualcomm's downstream battery-debug client registers owner 32781 while the
 request header retains battery-manager owner 32778.  Register that response
@@ -124,10 +124,10 @@ index 0311b89..12b2a94 100644
  	pmic_glink_client_register(battmgr->client);
  
 +	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
-+		battmgr->log_client = devm_pmic_glink_client_alloc(
-+			dev, PMIC_GLINK_OWNER_BATTMGR_DEBUG,
-+			qcom_battmgr_log_callback,
-+			qcom_battmgr_log_pdr_notify, battmgr);
++		battmgr->log_client =
++			devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR_DEBUG,
++					     qcom_battmgr_log_callback,
++					     qcom_battmgr_log_pdr_notify, battmgr);
 +		if (IS_ERR(battmgr->log_client))
 +			return PTR_ERR(battmgr->log_client);
 +
