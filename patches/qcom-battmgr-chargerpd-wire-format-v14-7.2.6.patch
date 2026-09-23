@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 04:00:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: fix chargerpd logging wire
+ format
+
+The first sheng logging-control test transmitted a 32-byte opcode 0x19
+request and received no response.  Both suspend and resume timed out, while
+the immediately following standard battery notification request received a
+16-byte response normally.
+
+The logical protocol is a 12-byte header followed by a 64-bit category mask
+and a 32-bit level.  Avoid host ABI padding by representing the little-endian
+64-bit mask as explicit low and high 32-bit words, giving an exact 24-byte
+wire request.
+
+Qualcomm's downstream battery-debug client registers owner 32781 while the
+request header retains battery-manager owner 32778.  Register that response
+owner as well, and route either owner to the same validated 16-byte generic
+response handler.  The additional client does not affect transmitted bytes;
+it only covers the firmware's response-owner convention.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 56 ++++++++++++++++++++++++++++++---
+ 1 file changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 0311b89..12b2a94 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -40,6 +40,7 @@ enum qcom_battmgr_variant {
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
+ #define BATTMGR_DISABLE_NOTIFICATION	0x5
+ #define BATTMGR_SET_LOGGING_PROPERTIES	0x19
++#define PMIC_GLINK_OWNER_BATTMGR_DEBUG	32781
+ 
+ #define SHENG_CHARGERPD_LOG_CATEGORIES	0xe00008000ULL
+ #define SHENG_CHARGERPD_LOG_LEVEL	4
+@@ -190,10 +191,16 @@ struct qcom_battmgr_enable_request {
+ 
+ struct qcom_battmgr_log_properties_request {
+ 	struct pmic_glink_hdr hdr;
+-	__le64 categories;
++	__le32 categories_low;
++	__le32 categories_high;
+ 	__le32 level;
+ };
+ 
++struct qcom_battmgr_generic_response {
++	struct pmic_glink_hdr hdr;
++	__le32 status;
++};
++
+ struct qcom_battmgr_property_request {
+ 	struct pmic_glink_hdr hdr;
+ 	__le32 battery;
+@@ -406,6 +413,7 @@ struct qcom_battmgr_wireless {
+ struct qcom_battmgr {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
++	struct pmic_glink_client *log_client;
+ 
+ 	enum qcom_battmgr_variant variant;
+ 
+@@ -2622,6 +2630,35 @@ out_complete:
+ 	complete(&battmgr->ack);
+ }
+ 
++static void qcom_battmgr_finish_log_request(struct qcom_battmgr *battmgr,
++					    const void *data, size_t len)
++{
++	const struct qcom_battmgr_generic_response *resp = data;
++
++	if (len == sizeof(*resp))
++		battmgr->error = le32_to_cpu(resp->status);
++	else
++		battmgr->error = -ENODATA;
++
++	complete(&battmgr->ack);
++}
++
++static void qcom_battmgr_log_callback(const void *data, size_t len, void *priv)
++{
++	const struct pmic_glink_hdr *hdr = data;
++	struct qcom_battmgr *battmgr = priv;
++
++	if (len < sizeof(*hdr))
++		return;
++
++	if (le32_to_cpu(hdr->opcode) == BATTMGR_SET_LOGGING_PROPERTIES)
++		qcom_battmgr_finish_log_request(battmgr, data, len);
++}
++
++static void qcom_battmgr_log_pdr_notify(void *priv, int state)
++{
++}
++
+ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+@@ -2630,8 +2667,7 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 
+ 	if (opcode == BATTMGR_SET_LOGGING_PROPERTIES &&
+ 	    battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+-		battmgr->error = 0;
+-		complete(&battmgr->ack);
++		qcom_battmgr_finish_log_request(battmgr, data, len);
+ 		return;
+ 	}
+ 
+@@ -2664,7 +2700,8 @@ static int qcom_battmgr_set_log_properties(struct qcom_battmgr *battmgr,
+ 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+ 		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+ 		.hdr.opcode = cpu_to_le32(BATTMGR_SET_LOGGING_PROPERTIES),
+-		.categories = cpu_to_le64(categories),
++		.categories_low = cpu_to_le32(lower_32_bits(categories)),
++		.categories_high = cpu_to_le32(upper_32_bits(categories)),
+ 		.level = cpu_to_le32(level),
+ 	};
+ 
+@@ -2887,6 +2924,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 
+ 	pmic_glink_client_register(battmgr->client);
+ 
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		battmgr->log_client = devm_pmic_glink_client_alloc(
++			dev, PMIC_GLINK_OWNER_BATTMGR_DEBUG,
++			qcom_battmgr_log_callback,
++			qcom_battmgr_log_pdr_notify, battmgr);
++		if (IS_ERR(battmgr->log_client))
++			return PTR_ERR(battmgr->log_client);
++
++		pmic_glink_client_register(battmgr->log_client);
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.51.0

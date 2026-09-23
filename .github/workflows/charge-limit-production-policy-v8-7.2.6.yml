@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 daily-sleep candidate v13
+name: Build sheng 7.2.6 daily-sleep candidate v14
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 daily-sleep candidate v13
+    name: Build pinned 7.2.6 daily-sleep candidate v14
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -24,6 +24,7 @@ jobs:
       PMIC_SLEEP_PATCH: patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch
       PM_WIRE_PATCH: patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch
       CHARGERPD_LOG_PATCH: patches/qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch
+      CHARGERPD_WIRE_PATCH: patches/qcom-battmgr-chargerpd-wire-format-v14-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -58,8 +59,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: daily-sleep-v13-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch', 'patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch', 'patches/qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch') }}
+          key: daily-sleep-v14-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch', 'patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch', 'patches/qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch', 'patches/qcom-battmgr-chargerpd-wire-format-v14-7.2.6.patch') }}
           restore-keys: |
+            daily-sleep-v14-7.2.6-clang21-
             daily-sleep-v13-7.2.6-clang21-
             daily-sleep-v12-7.2.6-clang21-
             daily-sleep-v11-7.2.6-clang21-
@@ -94,6 +96,8 @@ jobs:
           git -C linux apply "${GITHUB_WORKSPACE}/${PM_WIRE_PATCH}"
           git -C linux apply --check "${GITHUB_WORKSPACE}/${CHARGERPD_LOG_PATCH}"
           git -C linux apply "${GITHUB_WORKSPACE}/${CHARGERPD_LOG_PATCH}"
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${CHARGERPD_WIRE_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${CHARGERPD_WIRE_PATCH}"
           git -C linux diff --check
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}" | tee checkpatch-v2.txt
@@ -109,6 +113,8 @@ jobs:
             "${GITHUB_WORKSPACE}/${PM_WIRE_PATCH}" | tee checkpatch-v12-pm-wire.txt
           linux/scripts/checkpatch.pl --strict --no-tree \
             "${GITHUB_WORKSPACE}/${CHARGERPD_LOG_PATCH}" | tee checkpatch-v13-chargerpd-log.txt
+          linux/scripts/checkpatch.pl --strict --no-tree \
+            "${GITHUB_WORKSPACE}/${CHARGERPD_WIRE_PATCH}" | tee checkpatch-v14-chargerpd-wire.txt
           grep -q '0 errors, 0 warnings' checkpatch-v2.txt
           grep -q '0 errors, 0 warnings' checkpatch-v7.txt
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
@@ -116,6 +122,7 @@ jobs:
           grep -q '0 errors, 0 warnings' checkpatch-v11-pmic.txt
           grep -q '0 errors, 0 warnings' checkpatch-v12-pm-wire.txt
           grep -q '0 errors, 0 warnings' checkpatch-v13-chargerpd-log.txt
+          grep -q '0 errors, 0 warnings' checkpatch-v14-chargerpd-wire.txt
 
       - name: Configure production kernel
         run: |
@@ -181,6 +188,7 @@ jobs:
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
             checkpatch-v8.txt checkpatch-v10-uart.txt checkpatch-v11-pmic.txt \
             checkpatch-v12-pm-wire.txt checkpatch-v13-chargerpd-log.txt \
+            checkpatch-v14-chargerpd-wire.txt \
             qcom-battmgr-probe-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
@@ -193,6 +201,7 @@ jobs:
           cp "$PMIC_SLEEP_PATCH" out/
           cp "$PM_WIRE_PATCH" out/
           cp "$CHARGERPD_LOG_PATCH" out/
+          cp "$CHARGERPD_WIRE_PATCH" out/
           git -C linux diff > out/kernel.patch
           {
             echo "workflow_repository=${GITHUB_REPOSITORY}"
@@ -204,7 +213,7 @@ jobs:
             echo "boot_cmdline=${BOOT_CMDLINE}"
             echo "BATTERY_QCOM_BATTMGR=built-in"
             echo "external_qcom_battmgr=blacklisted by boot cmdline"
-            echo "policy_version=v13"
+            echo "policy_version=v14"
             echo "policy_backend=xiaomi input_suspend 0x2a"
             echo "standard_abi=charge_control_start_threshold,charge_control_end_threshold"
             echo "disabled_tuple=0,100"
@@ -225,6 +234,9 @@ jobs:
             echo "chargerpd_log_active=categories 0xe00008000, level 4"
             echo "chargerpd_log_suspend=categories 0, level 0; exact active values restored on resume"
             echo "chargerpd_log_scope=XIAOMI_BATTMGR_SM8550 only; failures warn and do not abort PM"
+            echo "chargerpd_log_wire=exact 24 bytes: header plus categories low/high u32 plus level u32"
+            echo "chargerpd_log_response=validated 16-byte generic response; owner 32778 or 32781"
+            echo "chargerpd_log_v13_result=32-byte host-ABI padded request timed out on suspend and resume"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -242,18 +254,20 @@ jobs:
             qcom-battmgr-suspend-notifications-v11-7.2.6.patch \
             qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch \
             qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch \
+            qcom-battmgr-chargerpd-wire-format-v14-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt \
             checkpatch-v10-uart.txt checkpatch-v11-pmic.txt \
             checkpatch-v12-pm-wire.txt \
             checkpatch-v13-chargerpd-log.txt \
+            checkpatch-v14-chargerpd-wire.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
       - name: Upload production artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-daily-sleep-v13-chargerpd-log-pause
+          name: sheng-7.2.6-daily-sleep-v14-chargerpd-wire
           path: out/
           retention-days: 14
           if-no-files-found: error
