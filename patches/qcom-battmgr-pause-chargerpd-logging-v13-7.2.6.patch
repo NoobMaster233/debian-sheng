@@ -14,7 +14,7 @@ protocol on the Xiaomi SM8550 variant to set both fields to zero before
 system suspend.  Restore the exact sheng firmware values on resume so that
 normal awake diagnostics are preserved.
 
-Handle the header-only acknowledgement before the generic SM8350 payload
+Handle the header-only acknowledgment before the generic SM8350 payload
 length check.  A failed request is warned about but does not block system
 suspend or resume.  Other variants are unchanged.
 
@@ -22,8 +22,8 @@ Link: https://github.com/Project-Aloha/mu_aloha_platforms/blob/8d37e2bfab2f9d959
 Link: https://github.com/Xelef2000/ubuntu-touch-kernel-duo2/blob/e3e17ac06abc83a3aadc5b53424905b3d39b995e/drivers/soc/qcom/qti_battery_debug.c
 Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
 ---
- drivers/power/supply/qcom_battmgr.c | 53 ++++++++++++++++++++++++++---
- 1 file changed, 49 insertions(+), 4 deletions(-)
+ drivers/power/supply/qcom_battmgr.c | 54 ++++++++++++++++++++++++++---
+ 1 file changed, 51 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 index 2ce8b5a..c6461d4 100644
@@ -53,7 +53,7 @@ index 2ce8b5a..c6461d4 100644
  struct qcom_battmgr_property_request {
  	struct pmic_glink_hdr hdr;
  	__le32 battery;
-@@ -2618,7 +2628,11 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+@@ -2618,7 +2628,14 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
  	struct qcom_battmgr *battmgr = priv;
  	unsigned int opcode = le32_to_cpu(hdr->opcode);
  
@@ -62,7 +62,10 @@ index 2ce8b5a..c6461d4 100644
 +	    battmgr->variant == XIAOMI_BATTMGR_SM8550) {
 +		battmgr->error = 0;
 +		complete(&battmgr->ack);
-+	} else if (opcode == BATTMGR_NOTIFICATION)
++		return;
++	}
++
++	if (opcode == BATTMGR_NOTIFICATION)
  		qcom_battmgr_notification(battmgr, data, len);
  	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
  		 battmgr->variant == QCOM_BATTMGR_X1E80100)
@@ -113,9 +116,9 @@ index 2ce8b5a..c6461d4 100644
 +	    !battmgr->service_up)
 +		return 0;
 +
-+	ret = qcom_battmgr_set_log_properties(battmgr,
-+					       SHENG_CHARGERPD_LOG_CATEGORIES,
-+					       SHENG_CHARGERPD_LOG_LEVEL);
++	ret = qcom_battmgr_set_log_properties(
++		battmgr, SHENG_CHARGERPD_LOG_CATEGORIES,
++		SHENG_CHARGERPD_LOG_LEVEL);
 +	if (ret)
 +		dev_warn(battmgr->dev,
 +			 "failed to restore chargerpd logging after resume: %d\n",
