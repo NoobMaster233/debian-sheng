@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 05:00:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: disable sheng runtime logs
+
+After binding the dedicated logs channel, sheng accepts opcode 0x19 and
+returns a successful generic response.  Disabling logs only 226 ms before
+machine suspend is too late: one already queued fg_update_status line still
+arrives over the wake-capable battery channel and wakes APSS.
+
+Disable chargerpd debug categories when its service comes up and keep them
+disabled for the Linux runtime.  The same worker runs after resume, keeping
+the policy active across service or sleep transitions.  System suspend only
+pauses normal power notifications and no longer changes the log level.
+
+Restore the exact sheng firmware categories and level during driver removal
+or shutdown, after clearing the charge-limit backend.  This leaves firmware
+in its vendor state for the next boot while removing the suspend-time queue
+window during normal Linux use.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 53 +++++++++++++++++++++++++------------
+ 1 file changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index a13a1ba..e58d978 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -2737,6 +2737,14 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 	ret = qcom_battmgr_set_notifications(battmgr, true);
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
++	    battmgr->service_up) {
++		ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
++		if (ret)
++			dev_warn(battmgr->dev,
++				 "failed to disable chargerpd logging: %d\n", ret);
++	}
+ }
+ 
+ static int qcom_battmgr_suspend(struct device *dev)
+@@ -2749,12 +2757,6 @@ static int qcom_battmgr_suspend(struct device *dev)
+ 		return 0;
+ 
+ 	cancel_work_sync(&battmgr->enable_work);
+-	ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
+-	if (ret)
+-		dev_warn(battmgr->dev,
+-			 "failed to pause chargerpd logging for suspend: %d\n",
+-			 ret);
+-
+ 	ret = qcom_battmgr_set_notifications(battmgr, false);
+ 	if (ret)
+ 		dev_warn(battmgr->dev,
+@@ -2767,20 +2769,11 @@ static int qcom_battmgr_suspend(struct device *dev)
+ static int qcom_battmgr_resume(struct device *dev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+-	int ret;
+ 
+ 	if (battmgr->variant != XIAOMI_BATTMGR_SM8550 ||
+ 	    !battmgr->service_up)
+ 		return 0;
+ 
+-	ret = qcom_battmgr_set_log_properties(
+-		battmgr, SHENG_CHARGERPD_LOG_CATEGORIES,
+-		SHENG_CHARGERPD_LOG_LEVEL);
+-	if (ret)
+-		dev_warn(battmgr->dev,
+-			 "failed to restore chargerpd logging after resume: %d\n",
+-			 ret);
+-
+ 	schedule_work(&battmgr->enable_work);
+ 
+ 	return 0;
+@@ -2980,14 +2973,40 @@ static void qcom_battmgr_finish_charge_limit(struct qcom_battmgr *battmgr)
+ 	mutex_unlock(&battmgr->charge_limit_lock);
+ }
+ 
++static void qcom_battmgr_restore_log_settings(struct qcom_battmgr *battmgr)
++{
++	int ret;
++
++	if (battmgr->variant != XIAOMI_BATTMGR_SM8550)
++		return;
++
++	cancel_work_sync(&battmgr->enable_work);
++	if (!battmgr->service_up)
++		return;
++
++	ret = qcom_battmgr_set_log_properties(battmgr,
++					      SHENG_CHARGERPD_LOG_CATEGORIES,
++					      SHENG_CHARGERPD_LOG_LEVEL);
++	if (ret)
++		dev_warn(battmgr->dev,
++			 "failed to restore chargerpd logging while stopping: %d\n",
++			 ret);
++}
++
+ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ {
+-	qcom_battmgr_finish_charge_limit(dev_get_drvdata(&adev->dev));
++	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
++
++	qcom_battmgr_finish_charge_limit(battmgr);
++	qcom_battmgr_restore_log_settings(battmgr);
+ }
+ 
+ static void qcom_battmgr_shutdown(struct auxiliary_device *adev)
+ {
+-	qcom_battmgr_finish_charge_limit(dev_get_drvdata(&adev->dev));
++	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
++
++	qcom_battmgr_finish_charge_limit(battmgr);
++	qcom_battmgr_restore_log_settings(battmgr);
+ }
+ 
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+-- 
+2.51.0
