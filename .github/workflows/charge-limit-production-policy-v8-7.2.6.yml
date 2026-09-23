@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 daily-sleep candidate v11
+name: Build sheng 7.2.6 daily-sleep candidate v12
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 daily-sleep candidate v11
+    name: Build pinned 7.2.6 daily-sleep candidate v12
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -22,6 +22,7 @@ jobs:
       READ_FIX_PATCH: patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch
       UART_SLEEP_PATCH: patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch
       PMIC_SLEEP_PATCH: patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch
+      PM_WIRE_PATCH: patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -56,8 +57,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: daily-sleep-v11-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch') }}
+          key: daily-sleep-v12-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch', 'patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch') }}
           restore-keys: |
+            daily-sleep-v12-7.2.6-clang21-
             daily-sleep-v11-7.2.6-clang21-
             daily-sleep-v10-7.2.6-clang21-
             charge-policy-v9-7.2.6-clang21-
@@ -86,6 +88,8 @@ jobs:
           git -C linux apply "${GITHUB_WORKSPACE}/${UART_SLEEP_PATCH}"
           git -C linux apply --check "${GITHUB_WORKSPACE}/${PMIC_SLEEP_PATCH}"
           git -C linux apply "${GITHUB_WORKSPACE}/${PMIC_SLEEP_PATCH}"
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${PM_WIRE_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${PM_WIRE_PATCH}"
           git -C linux diff --check
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}" | tee checkpatch-v2.txt
@@ -97,11 +101,14 @@ jobs:
             "${GITHUB_WORKSPACE}/${UART_SLEEP_PATCH}" | tee checkpatch-v10-uart.txt
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PMIC_SLEEP_PATCH}" | tee checkpatch-v11-pmic.txt
+          linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
+            "${GITHUB_WORKSPACE}/${PM_WIRE_PATCH}" | tee checkpatch-v12-pm-wire.txt
           grep -q '0 errors, 0 warnings' checkpatch-v2.txt
           grep -q '0 errors, 0 warnings' checkpatch-v7.txt
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
           grep -q '0 errors, 0 warnings' checkpatch-v10-uart.txt
           grep -q '0 errors, 0 warnings' checkpatch-v11-pmic.txt
+          grep -q '0 errors, 0 warnings' checkpatch-v12-pm-wire.txt
 
       - name: Configure production kernel
         run: |
@@ -133,6 +140,7 @@ jobs:
           grep -q ' qcom_battmgr_driver$' linux/System.map
           grep -q ' qcom_geni_serial_suspend$' linux/System.map
           grep -q ' qcom_geni_serial_resume$' linux/System.map
+          grep -q ' qcom_battmgr_pm_ops$' linux/System.map
           llvm-nm -a linux/drivers/power/supply/qcom_battmgr.o | \
             grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging|charge_control_limit|charge_control_limit_max|constant_charge_current)|charge_limit|input_suspend' \
             > qcom-battmgr-probe-symbols.txt
@@ -161,6 +169,7 @@ jobs:
           mkdir -p out
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
             checkpatch-v8.txt checkpatch-v10-uart.txt checkpatch-v11-pmic.txt \
+            checkpatch-v12-pm-wire.txt \
             qcom-battmgr-probe-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
@@ -171,6 +180,7 @@ jobs:
           cp "$READ_FIX_PATCH" out/
           cp "$UART_SLEEP_PATCH" out/
           cp "$PMIC_SLEEP_PATCH" out/
+          cp "$PM_WIRE_PATCH" out/
           git -C linux diff > out/kernel.patch
           {
             echo "workflow_repository=${GITHUB_REPOSITORY}"
@@ -182,7 +192,7 @@ jobs:
             echo "boot_cmdline=${BOOT_CMDLINE}"
             echo "BATTERY_QCOM_BATTMGR=built-in"
             echo "external_qcom_battmgr=blacklisted by boot cmdline"
-            echo "policy_version=v11"
+            echo "policy_version=v12"
             echo "policy_backend=xiaomi input_suspend 0x2a"
             echo "standard_abi=charge_control_start_threshold,charge_control_end_threshold"
             echo "disabled_tuple=0,100"
@@ -196,6 +206,8 @@ jobs:
             echo "pmic_sleep_fix=send Xiaomi downstream notification disable opcode 0x05 on system suspend and re-enable opcode 0x04 on resume"
             echo "pmic_sleep_evidence=XM_PROP_CHG_DEBUG property 75, 220-byte chg_debug_msg, CHG_ADSP_LOG type 1"
             echo "pmic_sleep_scope=XIAOMI_BATTMGR_SM8550 only; disable failure does not block suspend"
+            echo "pmic_sleep_wiring=standard dev_pm_ops on embedded auxiliary device_driver.pm"
+            echo "pmic_sleep_v11_result=legacy auxiliary_driver suspend/resume fields were not wired by this kernel auxiliary bus"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -211,16 +223,18 @@ jobs:
             qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch \
             qcom-geni-ack-suspended-irq-v10-7.2.6.patch \
             qcom-battmgr-suspend-notifications-v11-7.2.6.patch \
+            qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt \
             checkpatch-v10-uart.txt checkpatch-v11-pmic.txt \
+            checkpatch-v12-pm-wire.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
       - name: Upload production artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-daily-sleep-v11-irq-ack-pmic-notify
+          name: sheng-7.2.6-daily-sleep-v12-dev-pm
           path: out/
           retention-days: 14
           if-no-files-found: error

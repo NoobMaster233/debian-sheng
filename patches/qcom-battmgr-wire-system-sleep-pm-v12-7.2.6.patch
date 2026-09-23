@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 01:55:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: wire sleep callbacks through
+ dev_pm_ops
+
+The auxiliary_driver structure exposes legacy suspend and resume
+callbacks, but the auxiliary bus implementation in this kernel does not
+wire them into the PM core. As a result, the Xiaomi notification control
+callbacks added for system sleep are present in the image but never run.
+
+Use standard device PM operations on the embedded device_driver instead.
+The auxiliary driver registration code preserves driver.pm while filling
+the owner, bus, name and module fields, so the PM core invokes these
+callbacks through the normal path.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 111111111111..222222222222 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -2651,10 +2651,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+ }
+ 
+-static int qcom_battmgr_suspend(struct auxiliary_device *adev,
+-				pm_message_t state)
++static int qcom_battmgr_suspend(struct device *dev)
+ {
+-	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+ 	int ret;
+ 
+ 	if (battmgr->variant != XIAOMI_BATTMGR_SM8550 ||
+@@ -2671,9 +2670,9 @@ static int qcom_battmgr_suspend(struct auxiliary_device *adev,
+ 	return 0;
+ }
+ 
+-static int qcom_battmgr_resume(struct auxiliary_device *adev)
++static int qcom_battmgr_resume(struct device *dev)
+ {
+-	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+ 
+ 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+ 	    battmgr->service_up)
+@@ -2682,6 +2681,9 @@ static int qcom_battmgr_resume(struct auxiliary_device *adev)
+ 	return 0;
+ }
+ 
++static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_pm_ops, qcom_battmgr_suspend,
++				qcom_battmgr_resume);
++
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+@@ -2883,9 +2885,10 @@ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.probe = qcom_battmgr_probe,
+ 	.remove = qcom_battmgr_remove,
+ 	.shutdown = qcom_battmgr_shutdown,
+-	.suspend = qcom_battmgr_suspend,
+-	.resume = qcom_battmgr_resume,
+ 	.id_table = qcom_battmgr_id_table,
++	.driver = {
++		.pm = pm_sleep_ptr(&qcom_battmgr_pm_ops),
++	},
+ };
+ 
+ module_auxiliary_driver(qcom_battmgr_driver);
+-- 
+2.51.0
