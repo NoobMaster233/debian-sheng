@@ -15,9 +15,9 @@ main endpoint or changing its PDR state.  Add a log-channel send helper
 sharing the established serialization and retry behavior.  Incoming log
 channel responses use the existing owner-based client demultiplexer.
 
-Send qcom_battmgr logging requests through the new endpoint.  Preserve its
-generic response handling for owner 32778 or 32781.  Other battery, UCSI and
-AltMode traffic remains on the original PMIC_RTR endpoint.
+Send qcom_battmgr requests through the new endpoint.  Handle replies
+from owner 32778 or 32781.  Other battery, UCSI and AltMode traffic remains
+on the original PMIC_RTR endpoint.
 
 Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink.h
 Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink_cpdlogs.c
