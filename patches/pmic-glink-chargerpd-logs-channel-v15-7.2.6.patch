@@ -5,8 +5,8 @@ Subject: [PATCH] soc: qcom: pmic_glink: add chargerpd logs channel
 
 Qualcomm firmware exposes chargerpd logging control on the dedicated
 PMIC_LOGS_ADSP_APPS GLINK channel.  The existing driver only binds the
-PMIC_RTR endpoints, so opcode 0x19 sent through pmic_glink_send() reaches the
-wrong remote service and times out.  This was reproduced on sheng with
+PMIC_RTR endpoints.  Therefore opcode 0x19 sent through pmic_glink_send()
+reaches the wrong remote service and times out.  This was reproduced on
 both 32-byte host-padded and exact 24-byte requests; ordinary battery
 requests on PMIC_RTR continued to work.
 
@@ -15,9 +15,9 @@ main endpoint or changing its PDR state.  Add a log-channel send helper
 sharing the established serialization and retry behavior.  Incoming log
 channel responses use the existing owner-based client demultiplexer.
 
-Send qcom_battmgr logging requests through the new endpoint while preserving
-its generic response handling for owner 32778 or 32781.  Other battery, UCSI
-and AltMode traffic remains on the original PMIC_RTR endpoint.
+Send qcom_battmgr logging requests through the new endpoint.  Preserve its
+generic response handling for owner 32778 or 32781.  Other battery, UCSI and
+AltMode traffic remains on the original PMIC_RTR endpoint.
 
 Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink.h
 Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink_cpdlogs.c
