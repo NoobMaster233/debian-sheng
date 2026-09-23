@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 05:20:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: retry log endpoint startup
+
+On sheng the main charger service can report UP just before the dedicated
+PMIC_LOGS_ADSP_APPS endpoint is bound.  The initial runtime log-disable
+request then returns -ECONNRESET and is never retried, leaving debug logs
+enabled for the entire boot.
+
+Use a managed delayed work item to retry every 250 ms for at most 10
+seconds.  Remember the successful disabled state so normal suspend and
+resume do not resend the policy.  If startup never succeeds, make one
+synchronous attempt at suspend as a safety net.
+
+Register the debug-owner client before the main client can schedule work,
+reset the state on charger service loss, and cancel the delayed work before
+suspend or cleanup.  This removes the probe ordering race without adding a
+userspace service or an unbounded retry loop.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 64 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index e58d978..ce81c88 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -44,6 +44,8 @@ enum qcom_battmgr_variant {
+ 
+ #define SHENG_CHARGERPD_LOG_CATEGORIES	0xe00008000ULL
+ #define SHENG_CHARGERPD_LOG_LEVEL	4
++#define SHENG_CHARGERPD_LOG_RETRY_MS	250
++#define SHENG_CHARGERPD_LOG_MAX_ATTEMPTS	40
+ 
+ #define BATTMGR_NOTIFICATION		0x7
+ #define NOTIF_BAT_PROPERTY		0x30
+@@ -445,11 +447,14 @@ struct qcom_battmgr {
+ 	unsigned int battery_prop_probe;
+ 	u32 battery_prop_probe_value;
+ 	struct delayed_work charge_limit_work;
++	struct delayed_work log_disable_work;
+ 	/* Serialize charge-limit policy state and firmware commands. */
+ 	struct mutex charge_limit_lock;
+ 	bool charge_limit_suspended;
+ 	u32 charge_limit_last_soc;
+ 	int charge_limit_last_result;
++	unsigned int log_disable_attempts;
++	bool log_disabled;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -2728,6 +2733,33 @@ static int qcom_battmgr_set_log_properties(struct qcom_battmgr *battmgr,
+ 	return qcom_battmgr_log_request(battmgr, &req, sizeof(req));
+ }
+ 
++static void qcom_battmgr_log_disable_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						       struct qcom_battmgr,
++						       log_disable_work);
++	int ret;
++
++	if (!battmgr->service_up)
++		return;
++
++	ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
++	if (!ret) {
++		WRITE_ONCE(battmgr->log_disabled, true);
++		battmgr->log_disable_attempts = 0;
++		return;
++	}
++
++	WRITE_ONCE(battmgr->log_disabled, false);
++	if (++battmgr->log_disable_attempts < SHENG_CHARGERPD_LOG_MAX_ATTEMPTS) {
++		mod_delayed_work(system_wq, &battmgr->log_disable_work,
++				 msecs_to_jiffies(SHENG_CHARGERPD_LOG_RETRY_MS));
++		return;
++	}
++
++	dev_warn(battmgr->dev, "failed to disable chargerpd logging: %d\n", ret);
++}
++
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+@@ -2739,11 +2771,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+ 
+ 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550 &&
+-	    battmgr->service_up) {
+-		ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
+-		if (ret)
+-			dev_warn(battmgr->dev,
+-				 "failed to disable chargerpd logging: %d\n", ret);
++	    battmgr->service_up && !READ_ONCE(battmgr->log_disabled)) {
++		battmgr->log_disable_attempts = 0;
++		mod_delayed_work(system_wq, &battmgr->log_disable_work, 0);
+ 	}
+ }
+ 
+@@ -2757,6 +2787,17 @@ static int qcom_battmgr_suspend(struct device *dev)
+ 		return 0;
+ 
+ 	cancel_work_sync(&battmgr->enable_work);
++	cancel_delayed_work_sync(&battmgr->log_disable_work);
++	if (!READ_ONCE(battmgr->log_disabled)) {
++		ret = qcom_battmgr_set_log_properties(battmgr, 0, 0);
++		if (ret)
++			dev_warn(battmgr->dev,
++				 "failed to disable chargerpd logging for suspend: %d\n",
++				 ret);
++		else
++			WRITE_ONCE(battmgr->log_disabled, true);
++	}
++
+ 	ret = qcom_battmgr_set_notifications(battmgr, false);
+ 	if (ret)
+ 		dev_warn(battmgr->dev,
+@@ -2792,6 +2833,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 		qcom_battmgr_schedule_charge_limit(battmgr, 0);
+ 	} else {
+ 		battmgr->service_up = false;
++		WRITE_ONCE(battmgr->log_disabled, false);
+ 	}
+ }
+ 
+@@ -2860,6 +2902,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		if (ret)
+ 			return ret;
+ 
++		ret = devm_delayed_work_autocancel(dev, &battmgr->log_disable_work,
++						   qcom_battmgr_log_disable_worker);
++		if (ret)
++			return ret;
++
+ 		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_attr_group);
+ 		if (ret < 0)
+ 			return dev_err_probe(dev, ret, "failed to add Xiaomi battery attributes\n");
+@@ -2935,8 +2982,6 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
+-	pmic_glink_client_register(battmgr->client);
+-
+ 	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
+ 		battmgr->log_client =
+ 			devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR_DEBUG,
+@@ -2948,6 +2993,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		pmic_glink_client_register(battmgr->log_client);
+ 	}
+ 
++	pmic_glink_client_register(battmgr->client);
++
+ 	return 0;
+ }
+ 
+@@ -2981,6 +3028,7 @@ static void qcom_battmgr_restore_log_settings(struct qcom_battmgr *battmgr)
+ 		return;
+ 
+ 	cancel_work_sync(&battmgr->enable_work);
++	cancel_delayed_work_sync(&battmgr->log_disable_work);
+ 	if (!battmgr->service_up)
+ 		return;
+ 
+@@ -2991,6 +3039,8 @@ static void qcom_battmgr_restore_log_settings(struct qcom_battmgr *battmgr)
+ 		dev_warn(battmgr->dev,
+ 			 "failed to restore chargerpd logging while stopping: %d\n",
+ 			 ret);
++	else
++		WRITE_ONCE(battmgr->log_disabled, false);
+ }
+ 
+ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+-- 
+2.51.0
