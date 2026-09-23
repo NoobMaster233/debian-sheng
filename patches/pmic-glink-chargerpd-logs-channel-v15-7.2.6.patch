@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 04:30:00 +0800
+Subject: [PATCH] soc: qcom: pmic_glink: add chargerpd logs channel
+
+Qualcomm firmware exposes chargerpd logging control on the dedicated
+PMIC_LOGS_ADSP_APPS GLINK channel.  The existing driver only binds the
+PMIC_RTR endpoints, so opcode 0x19 sent through pmic_glink_send() reaches the
+wrong remote service and times out.  This was reproduced on sheng with
+both 32-byte host-padded and exact 24-byte requests; ordinary battery
+requests on PMIC_RTR continued to work.
+
+Bind the existing RPMSG driver to PMIC_LOGS_ADSP_APPS without replacing the
+main endpoint or changing its PDR state.  Add a log-channel send helper
+sharing the established serialization and retry behavior.  Incoming log
+channel responses use the existing owner-based client demultiplexer.
+
+Send qcom_battmgr logging requests through the new endpoint while preserving
+its generic response handling for owner 32778 or 32781.  Other battery, UCSI
+and AltMode traffic remains on the original PMIC_RTR endpoint.
+
+Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink.h
+Link: https://github.com/mobstyle10-arch/BOOT.MXF.2.5.1/blob/c60ac2f1da8da430f246da52f375e1d986e77349/buildpath0/boot_images/boot/QcomPkg/Drivers/PmicGlinkDxe/pmic_glink_cpdlogs.c
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 22 +++++++++++++++-
+ drivers/soc/qcom/pmic_glink.c       | 50 +++++++++++++++++++++++++++++++------
+ include/linux/soc/qcom/pmic_glink.h |  1 +
+ 3 files changed, 64 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 225a9fc..a13a1ba 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -483,6 +483,26 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
+ 	return battmgr->error;
+ }
+ 
++static int qcom_battmgr_log_request(struct qcom_battmgr *battmgr,
++				    void *data, size_t len)
++{
++	unsigned long left;
++	int ret;
++
++	reinit_completion(&battmgr->ack);
++	battmgr->error = 0;
++
++	ret = pmic_glink_log_send(battmgr->log_client, data, len);
++	if (ret < 0)
++		return ret;
++
++	left = wait_for_completion_timeout(&battmgr->ack, HZ);
++	if (!left)
++		return -ETIMEDOUT;
++
++	return battmgr->error;
++}
++
+ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
+ 					 int property, u32 value)
+ {
+@@ -2705,7 +2725,7 @@ static int qcom_battmgr_set_log_properties(struct qcom_battmgr *battmgr,
+ 		.level = cpu_to_le32(level),
+ 	};
+ 
+-	return qcom_battmgr_request(battmgr, &req, sizeof(req));
++	return qcom_battmgr_log_request(battmgr, &req, sizeof(req));
+ }
+ 
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index 3042261..2833424 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -23,6 +23,12 @@ enum {
+ 	PMIC_GLINK_CLIENT_UCSI,
+ };
+ 
++enum pmic_glink_rpmsg_type {
++	PMIC_GLINK_RPMSG_MAIN,
++	PMIC_GLINK_RPMSG_MAIN_PDR,
++	PMIC_GLINK_RPMSG_LOGS,
++};
++
+ struct pmic_glink_data {
+ 	unsigned long	client_mask;
+ 	const char	*charger_pdr_service_name;
+@@ -34,6 +40,7 @@ struct pmic_glink {
+ 	struct pdr_handle *pdr;
+ 
+ 	struct rpmsg_endpoint *ept;
++	struct rpmsg_endpoint *log_ept;
+ 
+ 	const struct pmic_glink_data *data;
+ 
+@@ -118,21 +125,19 @@ void pmic_glink_client_register(struct pmic_glink_client *client)
+ }
+ EXPORT_SYMBOL_GPL(pmic_glink_client_register);
+ 
+-int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
++static int __pmic_glink_send(struct rpmsg_endpoint *ept,
++			     void *data, size_t len)
+ {
+-	struct pmic_glink *pg = client->pg;
+ 	bool timeout_reached = false;
+ 	unsigned long start;
+ 	int ret;
+ 
+-	guard(mutex)(&pg->state_lock);
+-	if (!pg->ept) {
++	if (!ept)
+ 		return -ECONNRESET;
+-	}
+ 
+ 	start = jiffies;
+ 	for (;;) {
+-		ret = rpmsg_send(pg->ept, data, len);
++		ret = rpmsg_send(ept, data, len);
+ 		if (ret != -EAGAIN)
+ 			break;
+ 
+@@ -147,8 +152,25 @@ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
+ 
+ 	return ret;
+ }
++
++int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
++{
++	struct pmic_glink *pg = client->pg;
++
++	guard(mutex)(&pg->state_lock);
++	return __pmic_glink_send(pg->ept, data, len);
++}
+ EXPORT_SYMBOL_GPL(pmic_glink_send);
+ 
++int pmic_glink_log_send(struct pmic_glink_client *client, void *data, size_t len)
++{
++	struct pmic_glink *pg = client->pg;
++
++	guard(mutex)(&pg->state_lock);
++	return __pmic_glink_send(pg->log_ept, data, len);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_log_send);
++
+ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
+ 				     int len, void *priv, u32 addr)
+ {
+@@ -253,6 +275,12 @@ static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
+ 		return dev_err_probe(&rpdev->dev, -ENODEV, "no pmic_glink device to attach to\n");
+ 
+ 	dev_set_drvdata(&rpdev->dev, pg);
++	if (rpdev->id.driver_data == PMIC_GLINK_RPMSG_LOGS) {
++		guard(mutex)(&pg->state_lock);
++		pg->log_ept = rpdev->ept;
++		return 0;
++	}
++
+ 	pg->pdr_available = rpdev->id.driver_data;
+ 
+ 	guard(mutex)(&pg->state_lock);
+@@ -274,6 +302,11 @@ static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
+ 		return;
+ 
+ 	guard(mutex)(&pg->state_lock);
++	if (rpdev->id.driver_data == PMIC_GLINK_RPMSG_LOGS) {
++		pg->log_ept = NULL;
++		return;
++	}
++
+ 	pg->ept = NULL;
+ 	if (!pg->pdr_available)
+ 		pg->pdr_state = SERVREG_SERVICE_STATE_DOWN;
+@@ -281,8 +314,9 @@ static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
+ }
+ 
+ static const struct rpmsg_device_id pmic_glink_rpmsg_id_match[] = {
+-	{.name = "PMIC_RTR_ADSP_APPS", .driver_data = true },
+-	{.name = "PMIC_RTR_SOCCP_APPS", .driver_data = false },
++	{ .name = "PMIC_RTR_ADSP_APPS", .driver_data = PMIC_GLINK_RPMSG_MAIN_PDR },
++	{ .name = "PMIC_RTR_SOCCP_APPS", .driver_data = PMIC_GLINK_RPMSG_MAIN },
++	{ .name = "PMIC_LOGS_ADSP_APPS", .driver_data = PMIC_GLINK_RPMSG_LOGS },
+ 	{}
+ };
+ 
+diff --git a/include/linux/soc/qcom/pmic_glink.h b/include/linux/soc/qcom/pmic_glink.h
+index 7cddf10..437a583 100644
+--- a/include/linux/soc/qcom/pmic_glink.h
++++ b/include/linux/soc/qcom/pmic_glink.h
+@@ -22,6 +22,7 @@ struct pmic_glink_hdr {
+ };
+ 
+ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len);
++int pmic_glink_log_send(struct pmic_glink_client *client, void *data, size_t len);
+ 
+ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
+ 						       unsigned int id,
+-- 
+2.51.0
