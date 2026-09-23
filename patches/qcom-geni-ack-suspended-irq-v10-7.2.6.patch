@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Wed, 23 Sep 2026 23:55:00 +0800
+Subject: [PATCH] serial: qcom-geni: acknowledge IRQs during the suspend window
+
+serial_core sets uart_port::suspended before calling the driver's
+shutdown callback. The qcom-geni interrupt handler currently returns
+IRQ_NONE while that flag is set, without acknowledging any latched
+interrupt status. If an RX or DMA interrupt arrives before shutdown has
+masked the IRQ, the level-triggered line remains asserted and genirq can
+eventually disable it as unhandled. The port then cannot communicate
+after resume.
+
+The serial engine remains powered until shutdown has disabled the IRQ
+and uart_change_pm() has run. Acknowledge all four interrupt status
+registers in this narrow transition window and report the interrupt as
+handled. Normal suspended operation is unchanged because shutdown masks
+the IRQ before the runtime power transition.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/tty/serial/qcom_geni_serial.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index 4d7156b11483..0882096ab47c 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -1071,8 +1071,26 @@ static irqreturn_t qcom_geni_serial_isr(int isr, void *dev)
+ 	struct tty_port *tport = &uport->state->port;
+ 	struct qcom_geni_serial_port *port = to_dev_port(uport);
+ 
+-	if (uport->suspended)
+-		return IRQ_NONE;
++	/*
++	 * serial_core marks the port suspended before ->shutdown() masks the
++	 * IRQ. If a level-triggered RX or DMA interrupt arrives in that window,
++	 * returning IRQ_NONE leaves the status latched and genirq may disable
++	 * the line as unhandled. The hardware is still powered until shutdown
++	 * completes, so drain the pending status before returning.
++	 */
++	if (uport->suspended) {
++		m_irq_status = readl(uport->membase + SE_GENI_M_IRQ_STATUS);
++		s_irq_status = readl(uport->membase + SE_GENI_S_IRQ_STATUS);
++		dma_tx_status = readl(uport->membase + SE_DMA_TX_IRQ_STAT);
++		dma_rx_status = readl(uport->membase + SE_DMA_RX_IRQ_STAT);
++
++		writel(m_irq_status, uport->membase + SE_GENI_M_IRQ_CLEAR);
++		writel(s_irq_status, uport->membase + SE_GENI_S_IRQ_CLEAR);
++		writel(dma_tx_status, uport->membase + SE_DMA_TX_IRQ_CLR);
++		writel(dma_rx_status, uport->membase + SE_DMA_RX_IRQ_CLR);
++
++		return IRQ_HANDLED;
++	}
+ 
+ 	uart_port_lock(uport);
+ 
+-- 
+2.51.0
