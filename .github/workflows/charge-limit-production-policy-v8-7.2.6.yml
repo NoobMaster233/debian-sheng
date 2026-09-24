@@ -137,8 +137,6 @@ jobs:
             grep -E 'pmic_glink_ucsi_(callback|probe)|pm_wakeup_dev_event' \
             > ucsi-glink-symbols.txt
           grep -q ' U pm_wakeup_dev_event$' ucsi-glink-symbols.txt
-          llvm-nm -a linux/fs/pstore/pstore_blk.o > pstore-blk-symbols.txt
-          test -s pstore-blk-symbols.txt
 
       - name: Pack dual-boot boot image
         run: |
@@ -164,7 +162,6 @@ jobs:
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
             checkpatch-v8.txt checkpatch-v19.txt \
             qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
-            pstore-blk-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
           cp linux/System.map out/
@@ -220,7 +217,6 @@ jobs:
             qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch \
             ucsi-glink-wakeup-v19-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
-            pstore-blk-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt checkpatch-v19.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
