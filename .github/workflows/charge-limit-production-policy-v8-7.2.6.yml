@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 production charge-limit policy v8
+name: Build sheng 7.2.6 s2idle UCSI wake candidate v19
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 production charge-limit policy v8
+    name: Build pinned 7.2.6 s2idle UCSI wake candidate v19
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -20,6 +20,7 @@ jobs:
       PROBE_PATCH_V2: patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch
       POLICY_PATCH: patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch
       READ_FIX_PATCH: patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch
+      UCSI_WAKE_PATCH: patches/ucsi-glink-wakeup-v19-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -54,8 +55,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: charge-policy-v8-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch') }}
+          key: sleep-ucsi-v19-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/ucsi-glink-wakeup-v19-7.2.6.patch') }}
           restore-keys: |
+            sleep-ucsi-v19-7.2.6-clang21-
             charge-policy-v8-7.2.6-clang21-
             charge-policy-v7-7.2.6-clang21-
             charge-readonly-v2-7.2.6-clang21-
@@ -69,7 +71,7 @@ jobs:
           git -C linux checkout --detach FETCH_HEAD
           test "$(git -C linux rev-parse HEAD)" = "$KERNEL_BASE"
 
-      - name: Apply and lint production policy
+      - name: Apply and lint V8 plus upstream-posted UCSI wake fix
         run: |
           git -C linux apply --check "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}"
           git -C linux apply "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}"
@@ -77,6 +79,8 @@ jobs:
           git -C linux apply "${GITHUB_WORKSPACE}/${POLICY_PATCH}"
           git -C linux apply --check "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}"
           git -C linux apply "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}"
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${UCSI_WAKE_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${UCSI_WAKE_PATCH}"
           git -C linux diff --check
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}" | tee checkpatch-v2.txt
@@ -84,9 +88,12 @@ jobs:
             "${GITHUB_WORKSPACE}/${POLICY_PATCH}" | tee checkpatch-v7.txt
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${READ_FIX_PATCH}" | tee checkpatch-v8.txt
+          linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
+            "${GITHUB_WORKSPACE}/${UCSI_WAKE_PATCH}" | tee checkpatch-v19.txt
           grep -q '0 errors, 0 warnings' checkpatch-v2.txt
           grep -q '0 errors, 0 warnings' checkpatch-v7.txt
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
+          grep -q '0 errors, 0 warnings' checkpatch-v19.txt
 
       - name: Configure boot-only probe
         run: |
@@ -97,6 +104,7 @@ jobs:
             --set-str LOCALVERSION '-sm8550-00103-g42f3b40c702a'
           make -C linux ARCH=arm64 LLVM=1 LOCALVERSION= olddefconfig
           grep -qx 'CONFIG_BATTERY_QCOM_BATTMGR=y' linux/.config
+          grep -qx 'CONFIG_UCSI_PMIC_GLINK=y' linux/.config
           grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' linux/.config
           grep -qx 'CONFIG_LOCALVERSION="-sm8550-00103-g42f3b40c702a"' linux/.config
           actual_release="$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
@@ -119,6 +127,11 @@ jobs:
             grep -E 'probe_(night_charging|smart_batt|smart_chg|charging_suspend_battery|enable_charging|charge_control_limit|charge_control_limit_max|constant_charge_current)|charge_limit|input_suspend' \
             > qcom-battmgr-probe-symbols.txt
           test "$(wc -l < qcom-battmgr-probe-symbols.txt)" -ge 12
+          test -s linux/drivers/usb/typec/ucsi/ucsi_glink.o
+          llvm-nm -a linux/drivers/usb/typec/ucsi/ucsi_glink.o | \
+            grep -E 'pmic_glink_ucsi_(callback|probe)|pm_wakeup_dev_event' \
+            > ucsi-glink-symbols.txt
+          grep -q ' U pm_wakeup_dev_event$' ucsi-glink-symbols.txt
 
       - name: Pack dual-boot boot image
         run: |
@@ -142,8 +155,8 @@ jobs:
         run: |
           mkdir -p out
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
-            checkpatch-v8.txt \
-            qcom-battmgr-probe-symbols.txt \
+            checkpatch-v8.txt checkpatch-v19.txt \
+            qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
           cp linux/System.map out/
@@ -151,6 +164,7 @@ jobs:
           cp "$PROBE_PATCH_V2" out/
           cp "$POLICY_PATCH" out/
           cp "$READ_FIX_PATCH" out/
+          cp "$UCSI_WAKE_PATCH" out/
           git -C linux diff > out/kernel.patch
           {
             echo "workflow_repository=${GITHUB_REPOSITORY}"
@@ -171,6 +185,11 @@ jobs:
             echo "policy_cleanup=clear input_suspend on remove/shutdown"
             echo "threshold_reads=local policy state; no unsupported firmware GET"
             echo "private_write_test_attributes=none"
+            echo "sleep_fix_version=v19"
+            echo "sleep_fix_scope=ucsi_glink notification wake hold only"
+            echo "ucsi_wakeup_timeout_ms=50"
+            echo "ucsi_patch_status=upstream-posted v2; not merged at build preparation time"
+            echo "deployment=boot-only candidate; do not flash boot_b before runtime validation"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -184,15 +203,16 @@ jobs:
             qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch \
             qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch \
             qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch \
-            System.map qcom-battmgr-probe-symbols.txt \
-            checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt \
+            ucsi-glink-wakeup-v19-7.2.6.patch \
+            System.map qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
+            checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt checkpatch-v19.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
       - name: Upload probe artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-charge-limit-policy-v8
+          name: sheng-7.2.6-s2idle-ucsi-wake-v19
           path: out/
           retention-days: 14
           if-no-files-found: error
