@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 s2idle UCSI wake candidate v19
+name: Build sheng 7.2.6 s2idle pstore diagnostic v20
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 s2idle UCSI wake candidate v19
+    name: Build pinned 7.2.6 s2idle pstore diagnostic v20
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -21,7 +21,7 @@ jobs:
       POLICY_PATCH: patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch
       READ_FIX_PATCH: patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch
       UCSI_WAKE_PATCH: patches/ucsi-glink-wakeup-v19-7.2.6.patch
-      BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
+      BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr pstore_blk.blkdev=PARTUUID=926424af-29c6-6858-2e43-36c387870521 pstore_blk.kmsg_size=1024 pstore_blk.max_reason=5 pstore_blk.best_effort=1
 
     steps:
       - name: Install build tools
@@ -55,8 +55,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: sleep-ucsi-v19-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/ucsi-glink-wakeup-v19-7.2.6.patch') }}
+          key: sleep-pstore-v20-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/ucsi-glink-wakeup-v19-7.2.6.patch') }}
           restore-keys: |
+            sleep-pstore-v20-7.2.6-clang21-
             sleep-ucsi-v19-7.2.6-clang21-
             charge-policy-v8-7.2.6-clang21-
             charge-policy-v7-7.2.6-clang21-
@@ -95,16 +96,18 @@ jobs:
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
           grep -q '0 errors, 0 warnings' checkpatch-v19.txt
 
-      - name: Configure boot-only probe
+      - name: Configure boot-only pstore diagnostic
         run: |
           cp sm8550.config linux/.config
           linux/scripts/config --file linux/.config --enable BATTERY_QCOM_BATTMGR
+          linux/scripts/config --file linux/.config --enable PSTORE_BLK
           linux/scripts/config --file linux/.config --disable LOCALVERSION_AUTO
           linux/scripts/config --file linux/.config \
             --set-str LOCALVERSION '-sm8550-00103-g42f3b40c702a'
           make -C linux ARCH=arm64 LLVM=1 LOCALVERSION= olddefconfig
           grep -qx 'CONFIG_BATTERY_QCOM_BATTMGR=y' linux/.config
           grep -qx 'CONFIG_UCSI_PMIC_GLINK=y' linux/.config
+          grep -qx 'CONFIG_PSTORE_BLK=y' linux/.config
           grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' linux/.config
           grep -qx 'CONFIG_LOCALVERSION="-sm8550-00103-g42f3b40c702a"' linux/.config
           actual_release="$(make -s -C linux ARCH=arm64 LLVM=1 LOCALVERSION= kernelrelease)"
@@ -128,10 +131,12 @@ jobs:
             > qcom-battmgr-probe-symbols.txt
           test "$(wc -l < qcom-battmgr-probe-symbols.txt)" -ge 12
           test -s linux/drivers/usb/typec/ucsi/ucsi_glink.o
+          test -s linux/fs/pstore/pstore_blk.o
           llvm-nm -a linux/drivers/usb/typec/ucsi/ucsi_glink.o | \
             grep -E 'pmic_glink_ucsi_(callback|probe)|pm_wakeup_dev_event' \
             > ucsi-glink-symbols.txt
           grep -q ' U pm_wakeup_dev_event$' ucsi-glink-symbols.txt
+          grep -q ' pstore_blk_init$' linux/System.map
 
       - name: Pack dual-boot boot image
         run: |
@@ -185,11 +190,16 @@ jobs:
             echo "policy_cleanup=clear input_suspend on remove/shutdown"
             echo "threshold_reads=local policy state; no unsupported firmware GET"
             echo "private_write_test_attributes=none"
-            echo "sleep_fix_version=v19"
-            echo "sleep_fix_scope=ucsi_glink notification wake hold only"
+            echo "sleep_fix_version=v20"
+            echo "sleep_fix_scope=v19 ucsi_glink wake hold plus pstore block diagnostics"
             echo "ucsi_wakeup_timeout_ms=50"
             echo "ucsi_patch_status=upstream-posted v2; not merged at build preparation time"
-            echo "deployment=boot-only candidate; do not flash boot_b before runtime validation"
+            echo "pstore_backend=PSTORE_BLK built-in, best-effort block mode"
+            echo "pstore_blkdev=PARTUUID=926424af-29c6-6858-2e43-36c387870521"
+            echo "pstore_kmsg_size_kb=1024"
+            echo "pstore_max_reason=5"
+            echo "pstore_partition_write_gate=requires explicit runtime authorization after verified backup"
+            echo "deployment=boot-only diagnostic; do not flash boot_b"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -212,7 +222,7 @@ jobs:
       - name: Upload probe artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-s2idle-ucsi-wake-v19
+          name: sheng-7.2.6-s2idle-pstore-v20
           path: out/
           retention-days: 14
           if-no-files-found: error
