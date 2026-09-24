@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Qianzhou Wang <wangqianzhou@gmail.com>
+Date: Thu, 24 Sep 2026 08:45:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: add log control probe
+
+The chargerpd logging protocol is now reachable and acknowledged, but zero
+categories and level zero do not suppress Xiaomi's direct CHG_ADSP_LOG
+messages.  Qualcomm UEFI treats a zero category value as an uninitialized
+request for complete HLOS logs.  Determine the remaining category and level
+semantics on the device.
+
+Add a temporary root-writable Xiaomi sysfs attribute.  It accepts a
+hexadecimal category mask and a decimal level from zero through five.
+Serialize it with other battery commands.  Expose only the last request and
+result for controlled boot-only testing.
+
+This is a diagnostic ABI, not a production interface.  It must be removed
+after one runtime test matrix identifies the narrow final policy.
+
+Signed-off-by: Qianzhou Wang <wangqianzhou@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 46 +++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index ce81c88..d54e841 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -455,6 +455,9 @@ struct qcom_battmgr {
+ 	int charge_limit_last_result;
+ 	unsigned int log_disable_attempts;
+ 	bool log_disabled;
++	u64 log_test_categories;
++	u32 log_test_level;
++	int log_test_result;
+ 
+ 	struct work_struct enable_work;
+ 
+@@ -465,6 +468,9 @@ struct qcom_battmgr {
+ 	struct mutex lock;
+ };
+ 
++static int qcom_battmgr_set_log_properties(struct qcom_battmgr *battmgr,
++					   u64 categories, u32 level);
++
+ static struct qcom_battmgr *xiaomi_battmgr;
+ static DEFINE_MUTEX(xiaomi_battmgr_lock);
+ 
+@@ -1606,6 +1612,45 @@ static ssize_t verify_digest_store(struct device *dev,
+ 
+ static DEVICE_ATTR_RW(verify_digest);
+ 
++static ssize_t probe_chargerpd_log_control_show(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "categories=%#llx level=%u result=%d\n",
++			  (unsigned long long)battmgr->log_test_categories,
++			  battmgr->log_test_level,
++			  battmgr->log_test_result);
++}
++
++static ssize_t probe_chargerpd_log_control_store(struct device *dev,
++						 struct device_attribute *attr,
++						 const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	unsigned long long categories;
++	unsigned int level;
++	int ret;
++
++	if (sscanf(buf, "%llx %u", &categories, &level) != 2 || level > 5)
++		return -EINVAL;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_set_log_properties(battmgr, categories, level);
++	battmgr->log_test_categories = categories;
++	battmgr->log_test_level = level;
++	battmgr->log_test_result = ret;
++	mutex_unlock(&battmgr->lock);
++
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(probe_chargerpd_log_control);
++
+ static ssize_t charge_limit_status_show(struct device *dev,
+ 					struct device_attribute *attr,
+ 					char *buf)
+@@ -1785,6 +1830,7 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+ 	&dev_attr_request_vdm_cmd.attr,
+ 	&dev_attr_verify_slave_flag.attr,
+ 	&dev_attr_verify_digest.attr,
++	&dev_attr_probe_chargerpd_log_control.attr,
+ 	&dev_attr_charge_limit_status.attr,
+ 	NULL
+ };
+-- 
+2.51.0

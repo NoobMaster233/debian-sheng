@@ -1,4 +1,4 @@
-name: Build sheng 7.2.6 daily-sleep candidate v17
+name: Build sheng 7.2.6 daily-sleep diagnostic v18
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build pinned 7.2.6 daily-sleep candidate v17
+    name: Build pinned 7.2.6 daily-sleep diagnostic v18
     runs-on: ubuntu-24.04-arm
     container: debian:forky
     timeout-minutes: 180
@@ -28,6 +28,7 @@ jobs:
       CHARGERPD_CHANNEL_PATCH: patches/pmic-glink-chargerpd-logs-channel-v15-7.2.6.patch
       CHARGERPD_RUNTIME_PATCH: patches/qcom-battmgr-disable-runtime-logs-v16-7.2.6.patch
       CHARGERPD_RETRY_PATCH: patches/qcom-battmgr-log-endpoint-retry-v17-7.2.6.patch
+      CHARGERPD_PROBE_PATCH: patches/qcom-battmgr-log-control-probe-v18-7.2.6.patch
       BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr
 
     steps:
@@ -62,8 +63,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: daily-sleep-v17-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch', 'patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch', 'patches/qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch', 'patches/qcom-battmgr-chargerpd-wire-format-v14-7.2.6.patch', 'patches/pmic-glink-chargerpd-logs-channel-v15-7.2.6.patch', 'patches/qcom-battmgr-disable-runtime-logs-v16-7.2.6.patch', 'patches/qcom-battmgr-log-endpoint-retry-v17-7.2.6.patch') }}
+          key: daily-sleep-v18-7.2.6-clang21-${{ hashFiles('sm8550.config', 'patches/qcom-battmgr-readonly-charge-probe-v2-7.2.6.patch', 'patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch', 'patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch', 'patches/qcom-geni-ack-suspended-irq-v10-7.2.6.patch', 'patches/qcom-battmgr-suspend-notifications-v11-7.2.6.patch', 'patches/qcom-battmgr-wire-system-sleep-pm-v12-7.2.6.patch', 'patches/qcom-battmgr-pause-chargerpd-logging-v13-7.2.6.patch', 'patches/qcom-battmgr-chargerpd-wire-format-v14-7.2.6.patch', 'patches/pmic-glink-chargerpd-logs-channel-v15-7.2.6.patch', 'patches/qcom-battmgr-disable-runtime-logs-v16-7.2.6.patch', 'patches/qcom-battmgr-log-endpoint-retry-v17-7.2.6.patch', 'patches/qcom-battmgr-log-control-probe-v18-7.2.6.patch') }}
           restore-keys: |
+            daily-sleep-v17-7.2.6-clang21-
             daily-sleep-v16-7.2.6-clang21-
             daily-sleep-v15-7.2.6-clang21-
             daily-sleep-v14-7.2.6-clang21-
@@ -72,7 +74,6 @@ jobs:
             daily-sleep-v11-7.2.6-clang21-
             daily-sleep-v10-7.2.6-clang21-
             charge-policy-v9-7.2.6-clang21-
-            charge-policy-v8-7.2.6-clang21-
 
       - name: Fetch exact kernel baseline
         run: |
@@ -106,6 +107,8 @@ jobs:
           git -C linux apply "${GITHUB_WORKSPACE}/${CHARGERPD_RUNTIME_PATCH}"
           git -C linux apply --check "${GITHUB_WORKSPACE}/${CHARGERPD_RETRY_PATCH}"
           git -C linux apply "${GITHUB_WORKSPACE}/${CHARGERPD_RETRY_PATCH}"
+          git -C linux apply --check "${GITHUB_WORKSPACE}/${CHARGERPD_PROBE_PATCH}"
+          git -C linux apply "${GITHUB_WORKSPACE}/${CHARGERPD_PROBE_PATCH}"
           git -C linux diff --check
           linux/scripts/checkpatch.pl --strict --no-tree --no-signoff \
             "${GITHUB_WORKSPACE}/${PROBE_PATCH_V2}" | tee checkpatch-v2.txt
@@ -129,6 +132,8 @@ jobs:
             "${GITHUB_WORKSPACE}/${CHARGERPD_RUNTIME_PATCH}" | tee checkpatch-v16-chargerpd-runtime.txt
           linux/scripts/checkpatch.pl --strict --no-tree \
             "${GITHUB_WORKSPACE}/${CHARGERPD_RETRY_PATCH}" | tee checkpatch-v17-chargerpd-retry.txt
+          linux/scripts/checkpatch.pl --strict --no-tree \
+            "${GITHUB_WORKSPACE}/${CHARGERPD_PROBE_PATCH}" | tee checkpatch-v18-chargerpd-probe.txt
           grep -q '0 errors, 0 warnings' checkpatch-v2.txt
           grep -q '0 errors, 0 warnings' checkpatch-v7.txt
           grep -q '0 errors, 0 warnings' checkpatch-v8.txt
@@ -140,6 +145,7 @@ jobs:
           grep -q '0 errors, 0 warnings' checkpatch-v15-chargerpd-channel.txt
           grep -q '0 errors, 0 warnings' checkpatch-v16-chargerpd-runtime.txt
           grep -q '0 errors, 0 warnings' checkpatch-v17-chargerpd-retry.txt
+          grep -q '0 errors, 0 warnings' checkpatch-v18-chargerpd-probe.txt
 
       - name: Configure production kernel
         run: |
@@ -175,6 +181,7 @@ jobs:
           grep -q ' qcom_battmgr_pm_ops$' linux/System.map
           grep -q ' pmic_glink_log_send$' linux/System.map
           grep -q ' qcom_battmgr_log_disable_worker$' linux/System.map
+          grep -q ' probe_chargerpd_log_control_store$' linux/System.map
           strings linux/vmlinux | grep -qF 'PMIC_LOGS_ADSP_APPS'
           strings linux/vmlinux | grep -qF 'failed to disable chargerpd logging'
           strings linux/vmlinux | \
@@ -212,6 +219,7 @@ jobs:
             checkpatch-v15-chargerpd-channel.txt \
             checkpatch-v16-chargerpd-runtime.txt \
             checkpatch-v17-chargerpd-retry.txt \
+            checkpatch-v18-chargerpd-probe.txt \
             qcom-battmgr-probe-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
@@ -228,6 +236,7 @@ jobs:
           cp "$CHARGERPD_CHANNEL_PATCH" out/
           cp "$CHARGERPD_RUNTIME_PATCH" out/
           cp "$CHARGERPD_RETRY_PATCH" out/
+          cp "$CHARGERPD_PROBE_PATCH" out/
           git -C linux diff > out/kernel.patch
           {
             echo "workflow_repository=${GITHUB_REPOSITORY}"
@@ -239,7 +248,7 @@ jobs:
             echo "boot_cmdline=${BOOT_CMDLINE}"
             echo "BATTERY_QCOM_BATTMGR=built-in"
             echo "external_qcom_battmgr=blacklisted by boot cmdline"
-            echo "policy_version=v17"
+            echo "policy_version=v18-diagnostic"
             echo "policy_backend=xiaomi input_suspend 0x2a"
             echo "standard_abi=charge_control_start_threshold,charge_control_end_threshold"
             echo "disabled_tuple=0,100"
@@ -272,6 +281,8 @@ jobs:
             echo "chargerpd_log_v16_result=first disable raced log endpoint binding and returned -ECONNRESET"
             echo "chargerpd_log_retry=250 ms bounded retry for at most 10 seconds, plus one suspend fallback"
             echo "chargerpd_log_state=remember disabled state and avoid normal suspend/resume toggles"
+            echo "chargerpd_log_probe=root-writable boot-only category/level matrix; remove before production"
+            echo "chargerpd_log_zero_semantics=Qualcomm UEFI treats zero categories as complete HLOS logs"
           } > out/PROVENANCE.txt
           {
             file boot.img
@@ -293,6 +304,7 @@ jobs:
             pmic-glink-chargerpd-logs-channel-v15-7.2.6.patch \
             qcom-battmgr-disable-runtime-logs-v16-7.2.6.patch \
             qcom-battmgr-log-endpoint-retry-v17-7.2.6.patch \
+            qcom-battmgr-log-control-probe-v18-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt \
             checkpatch-v10-uart.txt checkpatch-v11-pmic.txt \
@@ -302,13 +314,14 @@ jobs:
             checkpatch-v15-chargerpd-channel.txt \
             checkpatch-v16-chargerpd-runtime.txt \
             checkpatch-v17-chargerpd-retry.txt \
+            checkpatch-v18-chargerpd-probe.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
 
       - name: Upload production artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sheng-7.2.6-daily-sleep-v17-log-retry
+          name: sheng-7.2.6-daily-sleep-v18-log-matrix
           path: out/
           retention-days: 14
           if-no-files-found: error
