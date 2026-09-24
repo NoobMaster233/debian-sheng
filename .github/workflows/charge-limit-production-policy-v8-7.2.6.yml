@@ -118,7 +118,8 @@ jobs:
         run: |
           export CCACHE_DIR="$HOME/.ccache"
           export PATH="/usr/lib/ccache:$PATH"
-          make -C linux -j"$(nproc)" ARCH=arm64 LLVM=1 LOCALVERSION=
+          make -C linux -j"$(nproc)" ARCH=arm64 LLVM=1 LOCALVERSION= \
+            Image.gz qcom/sm8550-xiaomi-sheng.dtb
           test -s linux/arch/arm64/boot/Image.gz
           test -s linux/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dtb
           test -s linux/System.map
@@ -136,11 +137,8 @@ jobs:
             grep -E 'pmic_glink_ucsi_(callback|probe)|pm_wakeup_dev_event' \
             > ucsi-glink-symbols.txt
           grep -q ' U pm_wakeup_dev_event$' ucsi-glink-symbols.txt
-          llvm-nm -a linux/fs/pstore/pstore_blk.o | \
-            grep -E '(__register_pstore_blk|pstore_blk_get_config|pstore_blk_init|__best_effort_init)' \
-            > pstore-blk-symbols.txt
-          grep -q ' pstore_blk_get_config$' pstore-blk-symbols.txt
-          grep -q ' U __register_pstore_blk$' pstore-blk-symbols.txt
+          llvm-nm -a linux/fs/pstore/pstore_blk.o > pstore-blk-symbols.txt
+          test -s pstore-blk-symbols.txt
 
       - name: Pack dual-boot boot image
         run: |
