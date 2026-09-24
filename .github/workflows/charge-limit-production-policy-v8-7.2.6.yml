@@ -21,7 +21,7 @@ jobs:
       POLICY_PATCH: patches/qcom-battmgr-sheng-charge-limit-v7-7.2.6.patch
       READ_FIX_PATCH: patches/qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch
       UCSI_WAKE_PATCH: patches/ucsi-glink-wakeup-v19-7.2.6.patch
-      BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr pstore_blk.blkdev=PARTUUID=926424af-29c6-6858-2e43-36c387870521 pstore_blk.kmsg_size=1024 pstore_blk.max_reason=5 pstore_blk.best_effort=1
+      BOOT_CMDLINE: root=PARTLABEL=linux module_blacklist=qcom_battmgr pstore_blk.blkdev=PARTUUID=926424af-29c6-6858-2e43-36c387870521 pstore_blk.kmsg_size=1024 pstore_blk.console_size=1024 pstore_blk.pmsg_size=0 pstore_blk.max_reason=5 pstore_blk.best_effort=1
 
     steps:
       - name: Install build tools
@@ -136,7 +136,11 @@ jobs:
             grep -E 'pmic_glink_ucsi_(callback|probe)|pm_wakeup_dev_event' \
             > ucsi-glink-symbols.txt
           grep -q ' U pm_wakeup_dev_event$' ucsi-glink-symbols.txt
-          grep -q ' pstore_blk_init$' linux/System.map
+          llvm-nm -a linux/fs/pstore/pstore_blk.o | \
+            grep -E '(__register_pstore_blk|pstore_blk_get_config|pstore_blk_init|__best_effort_init)' \
+            > pstore-blk-symbols.txt
+          grep -q ' pstore_blk_get_config$' pstore-blk-symbols.txt
+          grep -q ' U __register_pstore_blk$' pstore-blk-symbols.txt
 
       - name: Pack dual-boot boot image
         run: |
@@ -162,6 +166,7 @@ jobs:
           cp boot.img Image.gz-dtb_sheng checkpatch-v2.txt checkpatch-v7.txt \
             checkpatch-v8.txt checkpatch-v19.txt \
             qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
+            pstore-blk-symbols.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt out/
           cp linux/.config out/kernel.config
           cp linux/System.map out/
@@ -197,6 +202,8 @@ jobs:
             echo "pstore_backend=PSTORE_BLK built-in, best-effort block mode"
             echo "pstore_blkdev=PARTUUID=926424af-29c6-6858-2e43-36c387870521"
             echo "pstore_kmsg_size_kb=1024"
+            echo "pstore_console_size_kb=1024"
+            echo "pstore_pmsg_size_kb=0"
             echo "pstore_max_reason=5"
             echo "pstore_partition_write_gate=requires explicit runtime authorization after verified backup"
             echo "deployment=boot-only diagnostic; do not flash boot_b"
@@ -215,6 +222,7 @@ jobs:
             qcom-battmgr-sheng-threshold-read-v8-7.2.6.patch \
             ucsi-glink-wakeup-v19-7.2.6.patch \
             System.map qcom-battmgr-probe-symbols.txt ucsi-glink-symbols.txt \
+            pstore-blk-symbols.txt \
             checkpatch-v2.txt checkpatch-v7.txt checkpatch-v8.txt checkpatch-v19.txt \
             clang-version.txt lld-version.txt llvm-nm-version.txt \
             PROVENANCE.txt BOOT_INFO.txt > SHA256SUMS)
